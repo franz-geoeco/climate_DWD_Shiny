@@ -1,21 +1,22 @@
 [general]
 name=DWD Climate Explorer
 qgisMinimumVersion=3.22
-description=Explore German Weather Service (DWD) station data, climate time series and Germany-wide interpolated climate grids, natively inside QGIS.
-about=Ports the "German Climate Dashboard" R/Shiny app to a QGIS plugin. Loads all ~6000 DWD weather stations as a real QGIS point layer (colour-coded by data availability), lets you click a station on the map canvas to inspect it, plots daily temperature/precipitation, hourly wind, 30-year climate diagrams, temperature trend & anomaly, and annual climate indices via embedded matplotlib panels, and downloads Germany-wide 1km x 1km interpolated climate grids straight into the map as styled raster layers. All data comes live from the DWD Open Data portal (opendata.dwd.de).
-version=1.1.0
+description=Explore German Weather Service (DWD) station data, climate time series, phenology (plant development-stage) observations and Germany-wide interpolated climate grids, natively inside QGIS.
+about=Ports the "German Climate Dashboard" R/Shiny app to a QGIS plugin. Loads all ~6000 DWD weather stations as a real QGIS point layer (colour-coded by data availability), lets you click a station on the map canvas to inspect it, plots daily temperature/precipitation, hourly wind, 30-year climate diagrams, temperature trend & anomaly, and annual climate indices via embedded matplotlib panels, downloads Germany-wide 1km x 1km interpolated climate grids straight into the map as styled raster layers, and charts phenological phase data (sowing, flowering, ripening, leaf colouring, ...) for field crops, fruit, vine and wild plants from DWD's separate phenology station network. All data comes live from the DWD Open Data portal (opendata.dwd.de). Requires the requests, pandas, numpy and matplotlib Python packages; these are already bundled with recent QGIS standalone installers, but if QGIS reports an import error, install them into QGIS's own Python via the OSGeo4W shell: python -m pip install requests pandas numpy matplotlib.
+version=1.2.0
 author=Franz Schulze
-email=freanz.schulze@geo.uni-halle.de
+email=franz.schulze@geo.uni-halle.de
 
-changelog=1.1.0 add Processing algorithms (station list/data, raster grid, delta/change map), one-click PDF station report, fix raster styling crash, fix temperature grid scaling (DWD stores values in tenths of a degree)
+changelog=1.2.0 add Phenology tab (plant development-stage data + trend charts for crops/fruit/vine/wild plants, annual + immediate reporter networks) with its own station picker, CSV export and Processing algorithms
+    1.1.0 add Processing algorithms (station list/data, raster grid, delta/change map), one-click PDF station report, fix raster styling crash, fix temperature grid scaling (DWD stores values in tenths of a degree)
     1.0.0 initial release
 
-tags=climate,weather,dwd,germany,meteorology,raster,timeseries,charts,deutscher wetterdienst,processing,pdf report
+tags=climate,weather,dwd,germany,meteorology,raster,timeseries,charts,deutscher wetterdienst,processing,pdf report,phenology,plants
 
-homepage=https://github.com/franz-geoeco/climate_DWD_Shiny
+homepage=https://github.com/franz-geoeco/climate_DWD_Shiny/tree/main/qgis_plugin/dwd_climate_explorer
 tracker=https://github.com/franz-geoeco/climate_DWD_Shiny/issues
 repository=https://github.com/franz-geoeco/climate_DWD_Shiny
-category=Plugins
+category=Web
 icon=icons/dwd_icon.svg
 experimental=True
 deprecated=False

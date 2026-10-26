@@ -27,10 +27,12 @@ from . import dwd_client as c
 from . import plotting as p
 from . import station_layer as sl
 from . import raster_layer as rl
+from . import pheno_layer as pl
 from . import report
 from .range_slider import RangeSlider
 
 CURRENT_YEAR = 2026
+PHENO_REPORTER_KEYS = ["annual", "immediate"]
 
 
 def _swatch(colour):
@@ -82,6 +84,16 @@ class DWDDockWidget(QDockWidget):
         self.pick_tool = sl.StationPickTool(self.canvas, lambda: self.station_layer_obj)
         self.pick_tool.stationPicked.connect(self.on_station_picked)
 
+        # -- Phenology tab state --------------------------------------------
+        self.pheno_stations_df = None       # DataFrame, current reporter type
+        self.pheno_station_layer_obj = None
+        self.pheno_selected_station = None  # pandas Series
+        self.pheno_species_index = None     # dwd_client.PhenoSpeciesIndex, current reporter+category
+        self.pheno_data = None              # DataFrame from fetch_phenology_species_data
+
+        self.pheno_pick_tool = sl.StationPickTool(self.canvas, lambda: self.pheno_station_layer_obj)
+        self.pheno_pick_tool.stationPicked.connect(self.on_pheno_station_picked)
+
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -97,6 +109,7 @@ class DWDDockWidget(QDockWidget):
         self.tabs.addTab(self._build_stations_tab(), "Stations")
         self.tabs.addTab(self._build_climate_tab(), "Climate")
         self.tabs.addTab(self._build_raster_tab(), "Raster Grids")
+        self.tabs.addTab(self._build_phenology_tab(), "Phenology")
 
         self.setWidget(root)
 
@@ -448,6 +461,144 @@ class DWDDockWidget(QDockWidget):
         layout.addStretch(1)
         return w
 
+    def _build_phenology_tab(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        info = QLabel(
+            "Plant development-stage observations (sowing, flowering, ripening, leaf colouring, "
+            "...) from DWD's phenology network -- a separate set of stations from the climate "
+            "network on the other tabs."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        source_box = QGroupBox("Data source")
+        source_layout = QFormLayout(source_box)
+
+        reporter_row = QHBoxLayout()
+        self.pheno_reporter_group = QButtonGroup(w)
+        self.radio_pheno_annual = QRadioButton("Annual reporters")
+        self.radio_pheno_immediate = QRadioButton("Immediate reporters")
+        self.radio_pheno_annual.setChecked(True)
+        self.pheno_reporter_group.addButton(self.radio_pheno_annual, 0)
+        self.pheno_reporter_group.addButton(self.radio_pheno_immediate, 1)
+        reporter_row.addWidget(self.radio_pheno_annual)
+        reporter_row.addWidget(self.radio_pheno_immediate)
+        source_layout.addRow("Reporter type:", reporter_row)
+
+        self.pheno_category_combo = QComboBox()
+        source_layout.addRow("Category:", self.pheno_category_combo)
+
+        self.pheno_species_combo = QComboBox()
+        source_layout.addRow("Species:", self.pheno_species_combo)
+
+        layout.addWidget(source_box)
+
+        self.pheno_reporter_group.idClicked.connect(self.on_pheno_reporter_changed)
+        self.pheno_category_combo.currentIndexChanged.connect(self.on_pheno_category_changed)
+
+        loc_box = QGroupBox("Station")
+        loc_layout = QVBoxLayout(loc_box)
+
+        mode_row = QHBoxLayout()
+        self.pheno_mode_group = QButtonGroup(w)
+        self.radio_pheno_city = QRadioButton("City name")
+        self.radio_pheno_coords = QRadioButton("Coordinates")
+        self.radio_pheno_map = QRadioButton("Pick on map")
+        self.radio_pheno_city.setChecked(True)
+        for i, rb in enumerate((self.radio_pheno_city, self.radio_pheno_coords, self.radio_pheno_map)):
+            self.pheno_mode_group.addButton(rb, i)
+            mode_row.addWidget(rb)
+        loc_layout.addLayout(mode_row)
+
+        self.pheno_location_stack = QStackedWidget()
+        loc_layout.addWidget(self.pheno_location_stack)
+
+        pcity_w = QWidget()
+        pcity_form = QFormLayout(pcity_w)
+        self.pheno_city_edit = QLineEdit()
+        self.pheno_city_edit.setPlaceholderText("e.g. Freiburg im Breisgau")
+        self.pheno_radius_spin = QSpinBox()
+        self.pheno_radius_spin.setRange(1, 300)
+        self.pheno_radius_spin.setValue(30)
+        self.pheno_radius_spin.setSuffix(" km")
+        pcity_form.addRow("City:", self.pheno_city_edit)
+        pcity_form.addRow("Search radius:", self.pheno_radius_spin)
+        self.pheno_location_stack.addWidget(pcity_w)
+
+        pcoords_w = QWidget()
+        pcoords_form = QFormLayout(pcoords_w)
+        self.pheno_lat_spin = QDoubleSpinBox()
+        self.pheno_lat_spin.setRange(47.0, 56.0)
+        self.pheno_lat_spin.setDecimals(4)
+        self.pheno_lat_spin.setValue(51.34)
+        self.pheno_lon_spin = QDoubleSpinBox()
+        self.pheno_lon_spin.setRange(5.0, 16.0)
+        self.pheno_lon_spin.setDecimals(4)
+        self.pheno_lon_spin.setValue(12.38)
+        pcoords_form.addRow("Latitude (°N):", self.pheno_lat_spin)
+        pcoords_form.addRow("Longitude (°E):", self.pheno_lon_spin)
+        self.pheno_location_stack.addWidget(pcoords_w)
+
+        pmap_w = QWidget()
+        pmap_layout = QVBoxLayout(pmap_w)
+        pmap_btn_row = QHBoxLayout()
+        self.btn_load_pheno_stations = QPushButton("Load / refresh phenology stations")
+        self.btn_load_pheno_stations.clicked.connect(self.on_load_pheno_stations)
+        pmap_btn_row.addWidget(self.btn_load_pheno_stations)
+        self.btn_pheno_pick_tool = QPushButton("Pick station on map")
+        self.btn_pheno_pick_tool.setCheckable(True)
+        self.btn_pheno_pick_tool.setEnabled(False)
+        self.btn_pheno_pick_tool.toggled.connect(self.on_toggle_pheno_pick_tool)
+        pmap_btn_row.addWidget(self.btn_pheno_pick_tool)
+        pmap_layout.addLayout(pmap_btn_row)
+        self.pheno_map_pick_label = QLabel("Load the phenology stations, enable 'Pick station on "
+                                            "map', then click a station marker on the canvas.")
+        self.pheno_map_pick_label.setWordWrap(True)
+        pmap_layout.addWidget(self.pheno_map_pick_label)
+        self.pheno_location_stack.addWidget(pmap_w)
+
+        self.pheno_mode_group.idClicked.connect(self.pheno_location_stack.setCurrentIndex)
+
+        self.btn_pheno_fetch = QPushButton("Fetch phenology data")
+        self.btn_pheno_fetch.clicked.connect(self.on_fetch_phenology)
+        loc_layout.addWidget(self.btn_pheno_fetch)
+
+        self.pheno_status_label = QLabel("")
+        self.pheno_status_label.setWordWrap(True)
+        loc_layout.addWidget(self.pheno_status_label)
+
+        layout.addWidget(loc_box)
+
+        chart_row = QHBoxLayout()
+        chart_row.addWidget(QLabel("Phase:"))
+        self.pheno_phase_combo = QComboBox()
+        chart_row.addWidget(self.pheno_phase_combo, 1)
+        self.btn_download_pheno = QPushButton("Download CSV")
+        self.btn_download_pheno.setEnabled(False)
+        self.btn_download_pheno.clicked.connect(self.on_download_phenology)
+        chart_row.addWidget(self.btn_download_pheno)
+        layout.addLayout(chart_row)
+
+        self.pheno_range_label = QLabel()
+        layout.addWidget(self.pheno_range_label)
+        self.pheno_range = RangeSlider()
+        self.pheno_range.setBounds(1900, CURRENT_YEAR)
+        self.pheno_range.setValues(1960, CURRENT_YEAR)
+        layout.addWidget(self.pheno_range)
+
+        self.pheno_panel = PlotPanel()
+        layout.addWidget(self.pheno_panel)
+
+        self.pheno_phase_combo.currentIndexChanged.connect(self._redraw_pheno)
+        self.pheno_range.rangeChanged.connect(self._redraw_pheno)
+        self._update_range_label(self.pheno_range_label, self.pheno_range)
+        self.pheno_range.rangeChanged.connect(lambda *_: self._update_range_label(self.pheno_range_label, self.pheno_range))
+
+        self._populate_pheno_categories()
+        return w
+
     def _update_raster_periods(self):
         variable = self.raster_var_combo.currentData()
         meta = c.RASTER_CATALOGUE[variable]
@@ -508,6 +659,8 @@ class DWDDockWidget(QDockWidget):
 
     def on_toggle_pick_tool(self, checked):
         if checked:
+            if self.btn_pheno_pick_tool.isChecked():
+                self.btn_pheno_pick_tool.setChecked(False)
             self._prev_map_tool = self.canvas.mapTool()
             self.canvas.setMapTool(self.pick_tool)
         else:
@@ -725,8 +878,10 @@ class DWDDockWidget(QDockWidget):
             return
         self._save_csv(self.bundle["data_wind"], "wind")
 
-    def _save_csv(self, df, kind):
-        station = self.selected_station["Stationsname"] if self.selected_station is not None else "station"
+    def _save_csv(self, df, kind, station_name=None):
+        if station_name is None:
+            station_name = self.selected_station["Stationsname"] if self.selected_station is not None else None
+        station = station_name if station_name is not None else "station"
         safe_name = "".join(ch if ch.isalnum() else "_" for ch in station)
         default = f"{kind}_data_{safe_name}.csv"
         path, _ = QFileDialog.getSaveFileName(self, "Save CSV", default, "CSV files (*.csv)")
@@ -879,7 +1034,207 @@ class DWDDockWidget(QDockWidget):
         )
 
     # ------------------------------------------------------------------
+    # Phenology tab
+    # ------------------------------------------------------------------
+    def _populate_pheno_categories(self):
+        """Populates the category combo only (pure config, no network call).
+        The species combo is loaded lazily -- either when the user actually
+        changes reporter/category, or on first use of 'Fetch phenology
+        data' -- so simply opening the dock widget never hits the network."""
+        reporter = PHENO_REPORTER_KEYS[self.pheno_reporter_group.checkedId()]
+        self.pheno_category_combo.blockSignals(True)
+        self.pheno_category_combo.clear()
+        for key, label in c.pheno_categories_for(reporter):
+            self.pheno_category_combo.addItem(label, key)
+        self.pheno_category_combo.blockSignals(False)
+        self.pheno_species_combo.clear()
+        self.pheno_species_index = None
+
+    def on_pheno_reporter_changed(self, _id):
+        self.pheno_stations_df = None
+        self.pheno_selected_station = None
+        self.btn_pheno_pick_tool.setEnabled(False)
+        self._populate_pheno_categories()
+
+    def on_pheno_category_changed(self, *_):
+        reporter = PHENO_REPORTER_KEYS[self.pheno_reporter_group.checkedId()]
+        category = self.pheno_category_combo.currentData()
+        self.pheno_species_combo.clear()
+        if category is None:
+            return
+        self.pheno_status_label.setText("Loading species list...")
+        QCoreApplication.processEvents()
+        try:
+            self.pheno_species_index = self._run_busy(c.list_phenology_species, reporter, category,
+                                                        session=self.session)
+        except Exception as e:
+            self._error(f"Could not load phenology species list: {e}")
+            self.pheno_status_label.setText("")
+            return
+        for token, entry in self.pheno_species_index.sorted_items():
+            self.pheno_species_combo.addItem(entry["label"], token)
+        self.pheno_status_label.setText(
+            f"{self.pheno_species_combo.count()} species available for this category.")
+
+    def on_load_pheno_stations(self):
+        reporter = PHENO_REPORTER_KEYS[self.pheno_reporter_group.checkedId()]
+        self.btn_load_pheno_stations.setEnabled(False)
+        try:
+            self.pheno_stations_df = self._run_busy(c.fetch_phenology_stations, reporter,
+                                                      session=self.session)
+        except Exception as e:
+            self._error(f"Could not load phenology station list: {e}")
+            return
+        finally:
+            self.btn_load_pheno_stations.setEnabled(True)
+
+        reporter_label = self.radio_pheno_annual.text() if reporter == "annual" else self.radio_pheno_immediate.text()
+        self.pheno_station_layer_obj = pl.add_or_replace_pheno_station_layer(
+            self.pheno_stations_df, reporter_label)
+        self.canvas.setExtent(self.canvas.mapSettings().layerExtentToOutputExtent(
+            self.pheno_station_layer_obj, self.pheno_station_layer_obj.extent()))
+        self.canvas.refresh()
+        n = len(self.pheno_stations_df)
+        self.pheno_map_pick_label.setText(
+            f"{n} phenology stations loaded. Click 'Pick station on map' and then click a marker.")
+        self.btn_pheno_pick_tool.setEnabled(True)
+
+    def on_toggle_pheno_pick_tool(self, checked):
+        if checked:
+            if self.btn_pick_tool.isChecked():
+                self.btn_pick_tool.setChecked(False)
+            self._prev_map_tool = self.canvas.mapTool()
+            self.canvas.setMapTool(self.pheno_pick_tool)
+        else:
+            if self._prev_map_tool is not None:
+                self.canvas.setMapTool(self._prev_map_tool)
+
+    def on_pheno_station_picked(self, station_id):
+        if self.pheno_stations_df is None:
+            return
+        rows = self.pheno_stations_df[self.pheno_stations_df["Stations_id"] == station_id]
+        if len(rows) == 0:
+            return
+        self.pheno_selected_station = rows.iloc[0]
+        sl.highlight_feature(self.pheno_station_layer_obj, self.canvas, station_id)
+        self.pheno_map_pick_label.setText(
+            f"Using station: {self.pheno_selected_station['Stationsname']} (ID {station_id})")
+
+    def _pheno_nearest_station(self, lat, lon, radius_km):
+        if self.pheno_stations_df is None:
+            reporter = PHENO_REPORTER_KEYS[self.pheno_reporter_group.checkedId()]
+            self.pheno_stations_df = self._run_busy(c.fetch_phenology_stations, reporter,
+                                                      session=self.session)
+        near = c.nearby_stations(self.pheno_stations_df, lat, lon, radius_km, require=None)
+        if len(near) == 0:
+            self._warn(f"No phenology station within {radius_km} km.")
+            return None
+        return near.iloc[0]
+
+    def on_fetch_phenology(self):
+        if self.pheno_species_combo.count() == 0:
+            self.on_pheno_category_changed()
+        species_token = self.pheno_species_combo.currentData()
+        if species_token is None:
+            self._warn("No species selected.")
+            return
+
+        mode = self.pheno_mode_group.checkedId()
+        try:
+            if mode == 2:  # map pick
+                if self.pheno_selected_station is None:
+                    self._warn("Pick a phenology station on the map first.")
+                    return
+                station_row = self.pheno_selected_station
+            elif mode == 0:  # city
+                city = self.pheno_city_edit.text().strip()
+                if not city:
+                    self._warn("Enter a city name.")
+                    return
+                geocoded = self._run_busy(c.geocode_city, city, session=self.session)
+                if geocoded is None:
+                    self._error(f"Could not geocode '{city}'.")
+                    return
+                lat, lon, _display = geocoded
+                station_row = self._pheno_nearest_station(lat, lon, self.pheno_radius_spin.value())
+                if station_row is None:
+                    return
+            else:  # coords
+                lat, lon = self.pheno_lat_spin.value(), self.pheno_lon_spin.value()
+                station_row = self._pheno_nearest_station(lat, lon, self.pheno_radius_spin.value())
+                if station_row is None:
+                    return
+        except Exception as e:
+            self._error(f"Location lookup failed: {e}")
+            return
+
+        reporter = PHENO_REPORTER_KEYS[self.pheno_reporter_group.checkedId()]
+        category = self.pheno_category_combo.currentData()
+        self.pheno_status_label.setText(
+            f"Fetching {self.pheno_species_combo.currentText()} data for {station_row['Stationsname']}...")
+        QCoreApplication.processEvents()
+        try:
+            df = self._run_busy(
+                c.fetch_phenology_species_data, reporter, category, species_token,
+                int(station_row["Stations_id"]), session=self.session,
+                species_index=self.pheno_species_index,
+            )
+        except Exception as e:
+            self._error(f"Could not fetch phenology data: {e}")
+            self.pheno_status_label.setText("")
+            return
+
+        self.pheno_selected_station = station_row
+        self.pheno_data = df
+
+        if df is None or len(df) == 0:
+            self.pheno_status_label.setText(
+                f"No phenology records for {station_row['Stationsname']} / "
+                f"{self.pheno_species_combo.currentText()}.")
+            self.pheno_phase_combo.clear()
+            self.btn_download_pheno.setEnabled(False)
+            self._redraw_pheno()
+            return
+
+        self.pheno_phase_combo.blockSignals(True)
+        self.pheno_phase_combo.clear()
+        phases = df[["Phase_id", "Phase_de"]].drop_duplicates().sort_values("Phase_id")
+        for phase_id, phase_de in phases.itertuples(index=False):
+            self.pheno_phase_combo.addItem(phase_de, int(phase_id))
+        self.pheno_phase_combo.blockSignals(False)
+
+        years = df["Referenzjahr"].dropna()
+        if len(years):
+            lo, hi = int(years.min()), int(years.max())
+            self.pheno_range.setBounds(lo, hi)
+            self.pheno_range.setValues(lo, hi)
+
+        self.pheno_status_label.setText(
+            f"Showing {station_row['Stationsname']} (ID {int(station_row['Stations_id'])}) -- "
+            f"{len(df)} records across {len(phases)} phase(s).")
+        self.btn_download_pheno.setEnabled(True)
+        self._redraw_pheno()
+
+    def _redraw_pheno(self, *_):
+        if self.pheno_selected_station is None:
+            return
+        phase_id = self.pheno_phase_combo.currentData()
+        p.plot_phenology_trend(self.pheno_panel.figure, self.pheno_data, phase_id,
+                                self.pheno_range.values(), self.pheno_selected_station["Stationsname"])
+        self.pheno_panel.redraw()
+
+    def on_download_phenology(self):
+        if self.pheno_data is None or len(self.pheno_data) == 0:
+            self._warn("No phenology data loaded yet.")
+            return
+        station_name = (self.pheno_selected_station["Stationsname"]
+                         if self.pheno_selected_station is not None else None)
+        self._save_csv(self.pheno_data, "phenology", station_name=station_name)
+
+    # ------------------------------------------------------------------
     def closeEvent(self, event):
         if self.canvas.mapTool() is self.pick_tool:
             self.canvas.unsetMapTool(self.pick_tool)
+        if self.canvas.mapTool() is self.pheno_pick_tool:
+            self.canvas.unsetMapTool(self.pheno_pick_tool)
         super().closeEvent(event)

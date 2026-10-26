@@ -271,6 +271,49 @@ def plot_indices(fig, indices, var_col, year_range, station_name):
     fig.tight_layout()
 
 
+def plot_phenology_trend(fig, df, phase_id, year_range, station_name):
+    """Entry day-of-year (Jultag) vs. year for one phenological phase --
+    scatter + linear trend, same visual language as plot_trend_anomaly. A
+    negative slope means the phase is happening earlier over time, the
+    standard phenology climate-change signal."""
+    fig.clear()
+    ax = fig.add_subplot(111)
+    if df is None or len(df) == 0:
+        ax.text(0.5, 0.5, "No phenology data available for this station/species.",
+                ha="center", va="center", color="#888888")
+        return
+
+    sub = df[df["Phase_id"] == phase_id].dropna(subset=["Jultag"])
+    sub = sub[(sub["Referenzjahr"] >= year_range[0]) & (sub["Referenzjahr"] <= year_range[1])]
+    if len(sub) == 0:
+        ax.text(0.5, 0.5, "No data for this phase in the selected year range.",
+                ha="center", va="center", color="#888888")
+        return
+
+    years = sub["Referenzjahr"].values.astype(float)
+    doy = sub["Jultag"].values.astype(float)
+
+    ax.scatter(years, doy, color=COL_TEMP, s=22, zorder=3)
+
+    if len(sub) >= 5:
+        slope, intercept = np.polyfit(years, doy, 1)
+        trend_y = intercept + slope * years
+        ax.plot(years, trend_y, color="black", lw=2, zorder=2)
+        per_decade = slope * 10
+        ax.legend(handles=[_dummy_line("black", f"Trend: {per_decade:+.1f} days / decade")],
+                  loc="upper left", fontsize=8, frameon=False)
+
+    phase_label = sub["Phase_de"].iloc[0] if "Phase_de" in sub.columns else str(phase_id)
+    plant_label = sub["Objekt_de"].iloc[0] if "Objekt_de" in sub.columns else ""
+
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Day of year")
+    ax.set_title(f"{plant_label} – {phase_label} – {station_name}", loc="left", fontsize=11)
+    ax.grid(axis="y", color="#eeeeee")
+    _attribute(ax)
+    fig.tight_layout()
+
+
 def _dummy_line(color, label):
     from matplotlib.lines import Line2D
     return Line2D([0], [0], color=color, lw=2, label=label)

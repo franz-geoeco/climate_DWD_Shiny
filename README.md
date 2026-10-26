@@ -10,12 +10,13 @@ An interactive R Shiny dashboard for exploring historical weather data from the 
 
 | Feature | Description |
 |---|---|
-| **Station Map** | Interactive Leaflet map showing all DWD stations across Germany. Click any marker to select it. |
-| **Climate Data** | Daily temperature and precipitation time-series for any station, any year range. |
-| **Wind Data** | Hourly wind speed and direction aggregated to daily means. |
-| **Climate Chart** | Classic Walter-Lieth climate diagram (temperature + precipitation by month) for a custom 30-year normal period. |
-| **CSV Export** | Download the displayed climate or wind data as a CSV file. |
-| **Flexible location input** | Search by city name (geocoded via OpenStreetMap), decimal coordinates, or by clicking the station map. |
+| 🗺️ **Station Map** | Interactive Leaflet map showing all DWD stations across Germany. Click any marker to select it. |
+| 🌡️ **Climate Data** | Daily temperature and precipitation time-series for any station, any year range. |
+| 💨 **Wind Data** | Hourly wind speed and direction aggregated to daily means. |
+| 📊 **Climate Chart** | Classic Walter-Lieth climate diagram (temperature + precipitation by month) for a custom 30-year normal period. |
+| 📥 **CSV Export** | Download the displayed climate or wind data as a CSV file. |
+| 📍 **Flexible location input** | Search by city name (geocoded via OpenStreetMap), decimal coordinates, or by clicking the station map. |
+| 🌱 **Phenology** | Plant development-stage data (sowing, flowering, ripening, leaf colouring, ...) for field crops, fruit, vine and wild plants, from DWD's separate phenology station network. Choose annual (long-term) or immediate (faster, shorter-record) reporters, a category, species and station, then chart the entry day-of-year trend for any reported phase. |
 
 ---
 

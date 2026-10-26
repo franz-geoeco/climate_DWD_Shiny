@@ -7,6 +7,7 @@ import pandas as pd
 from qgis.core import (
     Qgis, QgsProcessingAlgorithm, QgsProcessingProvider,
     QgsProcessingParameterNumber, QgsProcessingParameterEnum,
+    QgsProcessingParameterString,
     QgsProcessingParameterFolderDestination, QgsProcessingParameterRasterDestination,
     QgsProcessingParameterFeatureSink, QgsProcessingException,
     QgsFields, QgsField, QgsFeature, QgsFeatureSink,
@@ -19,6 +20,7 @@ from qgis.PyQt.QtGui import QIcon
 from . import dwd_client as c
 from . import station_layer as sl
 from . import raster_layer as rl
+from . import pheno_layer as pl
 
 ICON_PATH = os.path.join(os.path.dirname(__file__), "icons", "dwd_icon.svg")
 
@@ -28,6 +30,14 @@ PERIOD_CODES = list(c.PERIOD_LABELS.keys())
 PERIOD_LABELS_LIST = [c.PERIOD_LABELS[k] for k in PERIOD_CODES]
 YEAR_CODES = list(c.YEAR_RANGE_LABELS.keys())
 YEAR_LABELS_LIST = [c.YEAR_RANGE_LABELS[k] for k in YEAR_CODES]
+
+PHENO_REPORTER_KEYS = list(c.PHENO_REPORTER_TYPES.keys())
+PHENO_REPORTER_LABELS = [c.PHENO_REPORTER_TYPES[k]["label"] for k in PHENO_REPORTER_KEYS]
+PHENO_COMBO_KEYS = list(c.PHENO_CATEGORIES.keys())
+PHENO_COMBO_LABELS = [
+    f"{'Annual' if rep == 'annual' else 'Immediate'} reporters – {c.PHENO_CATEGORIES[(rep, cat)]['label']}"
+    for rep, cat in PHENO_COMBO_KEYS
+]
 
 
 class _StyleRasterPostProcessor(QgsProcessingLayerPostProcessorInterface):
@@ -79,6 +89,8 @@ class DWDProcessingProvider(QgsProcessingProvider):
         self.addAlgorithm(FetchStationDataAlgorithm())
         self.addAlgorithm(FetchRasterGridAlgorithm())
         self.addAlgorithm(DeltaRasterAlgorithm())
+        self.addAlgorithm(FetchPhenologyStationListAlgorithm())
+        self.addAlgorithm(FetchPhenologyDataAlgorithm())
 
 
 class _DWDAlgorithmBase(QgsProcessingAlgorithm):
@@ -348,3 +360,124 @@ class DeltaRasterAlgorithm(_DWDAlgorithmBase):
             pass
 
         return {self.OUTPUT: dest}
+
+
+class FetchPhenologyStationListAlgorithm(_DWDAlgorithmBase):
+    REPORTER = "REPORTER"
+    OUTPUT = "OUTPUT"
+
+    def name(self):
+        return "fetch_phenology_station_list"
+
+    def displayName(self):
+        return "Fetch DWD phenology station list"
+
+    def shortHelpString(self):
+        return ("Downloads the DWD phenology station list for the chosen reporter type "
+                "(annual/Jahresmelder or immediate/Sofortmelder) and builds a point layer. "
+                "This is a separate station network from the climate stations -- different "
+                "IDs, different coverage.")
+
+    def createInstance(self):
+        return FetchPhenologyStationListAlgorithm()
+
+    def initAlgorithm(self, config=None):
+        self.addParameter(QgsProcessingParameterEnum(
+            self.REPORTER, "Reporter type", options=PHENO_REPORTER_LABELS, defaultValue=0))
+        self.addParameter(QgsProcessingParameterFeatureSink(self.OUTPUT, "DWD phenology stations"))
+
+    def processAlgorithm(self, parameters, context, feedback):
+        idx = self.parameterAsEnum(parameters, self.REPORTER, context)
+        reporter = PHENO_REPORTER_KEYS[idx]
+        feedback.pushInfo("Fetching phenology station list from opendata.dwd.de...")
+        stations = c.fetch_phenology_stations(reporter)
+        layer = pl.build_pheno_station_layer(stations, PHENO_REPORTER_LABELS[idx])
+
+        sink, dest_id = self.parameterAsSink(
+            parameters, self.OUTPUT, context, layer.fields(), Qgis.WkbType.Point, layer.crs())
+        if sink is None:
+            raise QgsProcessingException(self.invalidSinkError(parameters, self.OUTPUT))
+        for feat in layer.getFeatures():
+            sink.addFeature(feat, QgsFeatureSink.FastInsert)
+
+        feedback.pushInfo(f"{len(stations)} phenology stations written.")
+        return {self.OUTPUT: dest_id}
+
+
+class FetchPhenologyDataAlgorithm(_DWDAlgorithmBase):
+    CATEGORY = "CATEGORY"
+    SPECIES = "SPECIES"
+    STATION_ID = "STATION_ID"
+    OUTPUT = "OUTPUT"
+
+    def name(self):
+        return "fetch_phenology_data"
+
+    def displayName(self):
+        return "Fetch DWD phenology data"
+
+    def shortHelpString(self):
+        return ("Downloads plant development-stage observations (sowing, flowering, ripening, "
+                "leaf colouring, ...) for one species at one phenology station -- a separate "
+                "station network from the climate stations used by the other algorithms; run "
+                "'Fetch DWD phenology station list' first to find a station ID. SPECIES must "
+                "match a species name from the dock widget's Phenology tab for the chosen "
+                "reporter type / category (e.g. 'Schneegloeckchen', spaces or underscores both "
+                "work, case-insensitive).")
+
+    def createInstance(self):
+        return FetchPhenologyDataAlgorithm()
+
+    def initAlgorithm(self, config=None):
+        self.addParameter(QgsProcessingParameterEnum(
+            self.CATEGORY, "Reporter type / category", options=PHENO_COMBO_LABELS, defaultValue=0))
+        self.addParameter(QgsProcessingParameterString(
+            self.SPECIES, "Species (e.g. 'Schneegloeckchen')"))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.STATION_ID, "Phenology station ID", Qgis.ProcessingNumberParameterType.Integer,
+            defaultValue=164, minValue=1))
+        self.addParameter(QgsProcessingParameterFeatureSink(self.OUTPUT, "Phenology records"))
+
+    def processAlgorithm(self, parameters, context, feedback):
+        reporter, category = PHENO_COMBO_KEYS[self.parameterAsEnum(parameters, self.CATEGORY, context)]
+        species_input = self.parameterAsString(parameters, self.SPECIES, context).strip()
+        station_id = self.parameterAsInt(parameters, self.STATION_ID, context)
+
+        feedback.pushInfo(f"Looking up species list for {reporter}/{category}...")
+        species_index = c.list_phenology_species(reporter, category)
+        needle = species_input.lower().replace(" ", "_")
+        token, matched_label = None, None
+        for candidate_token, entry in species_index.species.items():
+            if candidate_token.lower() == needle or entry["label"].lower() == species_input.lower():
+                token, matched_label = candidate_token, entry["label"]
+                break
+        if token is None:
+            available = ", ".join(sorted(e["label"] for e in species_index.species.values()))
+            raise QgsProcessingException(
+                f"Species '{species_input}' not found for this category. Available: {available}")
+
+        feedback.pushInfo(f"Fetching '{matched_label}' data for station {station_id}...")
+        df = c.fetch_phenology_species_data(
+            reporter, category, token, station_id, species_index=species_index)
+        if df is None:
+            df = pd.DataFrame()
+        if len(df) == 0:
+            feedback.pushWarning("No phenology records found for this station/species.")
+
+        cols = [col for col in df.columns if col != "_date"]
+        fields = QgsFields()
+        for col in cols:
+            fields.append(QgsField(col, QVariant.String))
+
+        sink, dest_id = self.parameterAsSink(
+            parameters, self.OUTPUT, context, fields, Qgis.WkbType.NoGeometry,
+            QgsCoordinateReferenceSystem())
+        if sink is None:
+            raise QgsProcessingException(self.invalidSinkError(parameters, self.OUTPUT))
+        for _, row in df.iterrows():
+            feat = QgsFeature(fields)
+            feat.setAttributes([None if pd.isna(row[col]) else str(row[col]) for col in cols])
+            sink.addFeature(feat, QgsFeatureSink.FastInsert)
+
+        feedback.pushInfo(f"{len(df)} phenology records written.")
+        return {self.OUTPUT: dest_id}

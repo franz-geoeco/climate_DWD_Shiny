@@ -408,7 +408,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def nearby_stations(stations_df, lat, lon, radius_km, require="has_daily_kl"):
-    df = stations_df[stations_df[require]].copy()
+    df = stations_df[stations_df[require]].copy() if require else stations_df.copy()
     df["dist_km"] = haversine_km(lat, lon, df["geoBreite"].values, df["geoLaenge"].values)
     df = df[df["dist_km"] <= radius_km].sort_values("dist_km")
     return df.reset_index(drop=True)
@@ -483,3 +483,232 @@ def fetch_raster_grid(variable, period, year_code, dest_path, session=None):
         last_status = r.status_code
     raise DwdError(f"Could not download raster grid (last HTTP status {last_status}). "
                     f"Tried: {candidates}")
+
+
+# ---------------------------------------------------------------------------
+# Phenology (plant development stages). This is a separate DWD network from
+# the climate stations above -- different station IDs, different geo
+# network -- split across two "reporter" sub-networks (annual / immediate)
+# and several plant categories. Unlike the climate zips, the data files
+# themselves are plain uncompressed semicolon-delimited text.
+# ---------------------------------------------------------------------------
+PHENO_BASE = "https://opendata.dwd.de/climate_environment/CDC/observations_germany/phenology/"
+PHENO_HELP_BASE = "https://opendata.dwd.de/climate_environment/CDC/help/"
+
+PHENO_REPORTER_TYPES = {
+    "annual": dict(
+        prefix="Jahresmelder",
+        station_file="PH_Beschreibung_Phaenologie_Stationen_Jahresmelder.txt",
+        label="Annual reporters (Jahresmelder) – long-term network, most species",
+    ),
+    "immediate": dict(
+        prefix="Sofortmelder",
+        station_file="PH_Beschreibung_Phaenologie_Stationen_Sofortmelder.txt",
+        label="Immediate reporters (Sofortmelder) – faster real-time reports, fewer species",
+    ),
+}
+
+# (reporter, category) -> folder + filename infix used to discover species by
+# scanning the historical/recent directory listings. infix="" means the
+# category has no shared infix token (see _dedupe_species_label).
+PHENO_CATEGORIES = {
+    ("annual", "crops"): dict(folder="annual_reporters/crops", infix="Landwirtschaft_Kulturpflanze", label="Field crops"),
+    ("annual", "farming"): dict(folder="annual_reporters/farming", infix="", label="Farming (discontinued ~1990/91)"),
+    ("annual", "fruit"): dict(folder="annual_reporters/fruit", infix="Obst", label="Fruit"),
+    ("annual", "vine"): dict(folder="annual_reporters/vine", infix="Weinrebe", label="Vine"),
+    ("annual", "wild"): dict(folder="annual_reporters/wild", infix="Wildwachsende_Pflanze", label="Wild plants"),
+    ("immediate", "crops"): dict(folder="immediate_reporters/crops", infix="Landwirtschaft_Kulturpflanze", label="Field crops"),
+    ("immediate", "fruit"): dict(folder="immediate_reporters/fruit", infix="Obst", label="Fruit"),
+    ("immediate", "wild"): dict(folder="immediate_reporters/wild", infix="Wildwachsende_Pflanze", label="Wild plants"),
+}
+
+
+def pheno_categories_for(reporter):
+    """Ordered (category_key, label) pairs available for one reporter type."""
+    return [(cat, meta["label"]) for (rep, cat), meta in PHENO_CATEGORIES.items() if rep == reporter]
+
+
+def _dedupe_species_label(token):
+    """DWD sometimes bakes the category name into the species token itself
+    (farming's 'Feldarbeit_Feldarbeit', vine's 'Weinrebe_fruehe_Reife' after
+    only the leading 'Weinrebe_' infix is stripped -- in vine's case the
+    repeat is a legitimate variety name, e.g. "Weinrebe (fruehe Reife)").
+    Only collapse an *exact* repeated leading token, so farming's literal
+    duplication is cleaned up without touching vine's real variety names."""
+    parts = token.split("_")
+    if len(parts) >= 2 and parts[0] == parts[1]:
+        parts = parts[1:]
+    return "_".join(parts)
+
+
+def _pretty_species_label(token):
+    return _dedupe_species_label(token).replace("_", " ").replace("-", " ").strip()
+
+
+class PhenoSpeciesIndex:
+    """species_token -> {hist_url, recent_url, label}, built by scanning the
+    historical/ and recent/ directory listings of one (reporter, category)
+    -- same directory-listing-regex technique as _list_hist_filenames above."""
+
+    def __init__(self):
+        self.species = {}
+
+    def sorted_items(self):
+        return sorted(self.species.items(), key=lambda kv: kv[1]["label"])
+
+
+def list_phenology_species(reporter, category, session=None):
+    session = session or _session()
+    rep_spec = PHENO_REPORTER_TYPES[reporter]
+    cat_spec = PHENO_CATEGORIES[(reporter, category)]
+    prefix = rep_spec["prefix"]
+    infix = cat_spec["infix"]
+    infix_part = re.escape(infix) + "_" if infix else ""
+    hist_pattern = re.compile(
+        r"PH_" + re.escape(prefix) + "_" + infix_part + r"(.+?)_(\d{4})_(\d{4})_hist\.txt")
+    recent_pattern = re.compile(
+        r"PH_" + re.escape(prefix) + "_" + infix_part + r"(.+?)_akt\.txt")
+
+    index = PhenoSpeciesIndex()
+    best_end = {}
+
+    hist_url = PHENO_BASE + cat_spec["folder"] + "/historical/"
+    r = session.get(hist_url, timeout=30)
+    if r.status_code == 200:
+        for m in hist_pattern.finditer(r.text):
+            token, end = m.group(1), int(m.group(3))
+            if token not in best_end or end > best_end[token]:
+                best_end[token] = end
+                index.species.setdefault(token, {})["hist_url"] = hist_url + m.group(0)
+
+    recent_url = PHENO_BASE + cat_spec["folder"] + "/recent/"
+    r = session.get(recent_url, timeout=30)
+    if r.status_code == 200:
+        for m in recent_pattern.finditer(r.text):
+            token = m.group(1)
+            index.species.setdefault(token, {})["recent_url"] = recent_url + m.group(0)
+
+    for token, entry in index.species.items():
+        entry.setdefault("hist_url", None)
+        entry.setdefault("recent_url", None)
+        entry["label"] = _pretty_species_label(token)
+
+    return index
+
+
+_PHENO_LOOKUP_CACHE = {}
+
+
+def _read_pheno_semicolon(session, url):
+    r = session.get(url, timeout=30)
+    r.raise_for_status()
+    try:
+        text = r.content.decode("utf-8")
+    except UnicodeDecodeError:
+        text = r.content.decode("latin-1")
+    df = pd.read_csv(io.StringIO(text), sep=";", skipinitialspace=True, dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+    keep = [c for c in df.columns if c and c != "eor" and not c.startswith("Unnamed")]
+    df = df[keep]
+    for col in df.columns:
+        df[col] = df[col].str.strip()
+    return df
+
+
+def fetch_phase_lookup(session=None):
+    """Global Phase_id -> name lookup, shared across every phenology
+    category (not category-specific)."""
+    if "phase" in _PHENO_LOOKUP_CACHE:
+        return _PHENO_LOOKUP_CACHE["phase"]
+    session = session or _session()
+    df = _read_pheno_semicolon(session, PHENO_HELP_BASE + "PH_Beschreibung_Phase.txt")
+    df = df.rename(columns={"Phase_ID": "Phase_id", "Phase": "Phase_de", "Phase_englisch": "Phase_en"})
+    df["Phase_id"] = df["Phase_id"].astype(int)
+    lookup = df.set_index("Phase_id")[["Phase_de", "Phase_en"]]
+    _PHENO_LOOKUP_CACHE["phase"] = lookup
+    return lookup
+
+
+def fetch_plant_lookup(session=None):
+    """Global Objekt_id -> species name lookup (DE/EN/Latin)."""
+    if "plant" in _PHENO_LOOKUP_CACHE:
+        return _PHENO_LOOKUP_CACHE["plant"]
+    session = session or _session()
+    df = _read_pheno_semicolon(session, PHENO_HELP_BASE + "PH_Beschreibung_Pflanze.txt")
+    df = df.rename(columns={
+        "Objekt_ID": "Objekt_id", "Objekt": "Objekt_de",
+        "Objekt_englisch": "Objekt_en", "Objekt_latein": "Objekt_latin",
+    })
+    df["Objekt_id"] = df["Objekt_id"].astype(int)
+    lookup = df.set_index("Objekt_id")[["Objekt_de", "Objekt_en", "Objekt_latin"]]
+    _PHENO_LOOKUP_CACHE["plant"] = lookup
+    return lookup
+
+
+def fetch_phenology_stations(reporter, session=None):
+    """The phenology station network -- a different set of stations (and
+    IDs) than the climate network built by build_station_index()."""
+    session = session or _session()
+    spec = PHENO_REPORTER_TYPES[reporter]
+    df = _read_pheno_semicolon(session, PHENO_HELP_BASE + spec["station_file"])
+    df = df.rename(columns={"geograph.Breite": "geoBreite", "geograph.Laenge": "geoLaenge"})
+    df["Stations_id"] = pd.to_numeric(df["Stations_id"], errors="coerce")
+    df["geoBreite"] = pd.to_numeric(df["geoBreite"], errors="coerce")
+    df["geoLaenge"] = pd.to_numeric(df["geoLaenge"], errors="coerce")
+    df["Stationshoehe"] = pd.to_numeric(df["Stationshoehe"], errors="coerce")
+    df = df.dropna(subset=["Stations_id", "geoBreite", "geoLaenge"])
+    df["Stations_id"] = df["Stations_id"].astype(int)
+    keep = ["Stations_id", "Stationsname", "geoBreite", "geoLaenge", "Stationshoehe", "Bundesland"]
+    return df[[c for c in keep if c in df.columns]].reset_index(drop=True)
+
+
+def fetch_phenology_species_data(reporter, category, species_token, station_id,
+                                  session=None, species_index=None):
+    """Downloads + combines the historical and recent records for one
+    species, filters to one station, and joins the phase/plant name lookups
+    (via the Phase_id/Objekt_id columns actually present in the data -- not
+    guessed from the filename, which is far more robust). Overlapping
+    (year, phase) rows keep the *recent* file's value, mirroring
+    fetch_product()'s historical/recent overlap policy above."""
+    session = session or _session()
+    if species_index is None:
+        species_index = list_phenology_species(reporter, category, session=session)
+    entry = species_index.species.get(species_token)
+    if entry is None:
+        raise DwdError(f"Unknown phenology species '{species_token}' for {reporter}/{category}")
+
+    parts = []
+    for key, is_recent in (("hist_url", False), ("recent_url", True)):
+        url = entry.get(key)
+        if not url:
+            continue
+        df = _read_pheno_semicolon(session, url)
+        df["_recent"] = is_recent
+        parts.append(df)
+    if not parts:
+        return None
+
+    combined = pd.concat(parts, ignore_index=True)
+    for col in ("Stations_id", "Referenzjahr", "Objekt_id", "Phase_id", "Jultag"):
+        if col in combined.columns:
+            combined[col] = pd.to_numeric(combined[col], errors="coerce")
+    combined = combined.dropna(subset=["Stations_id", "Referenzjahr", "Phase_id", "Objekt_id"])
+    combined["Stations_id"] = combined["Stations_id"].astype(int)
+    combined["Referenzjahr"] = combined["Referenzjahr"].astype(int)
+    combined["Phase_id"] = combined["Phase_id"].astype(int)
+    combined["Objekt_id"] = combined["Objekt_id"].astype(int)
+
+    combined = combined.sort_values("_recent").drop_duplicates(
+        subset=["Stations_id", "Referenzjahr", "Phase_id"], keep="last")
+    combined = combined.drop(columns=["_recent"])
+
+    sub = combined[combined["Stations_id"] == int(station_id)].copy()
+    if len(sub) == 0:
+        return sub
+
+    sub = sub.join(fetch_phase_lookup(session=session), on="Phase_id")
+    sub = sub.join(fetch_plant_lookup(session=session), on="Objekt_id")
+    if "Eintrittsdatum" in sub.columns:
+        sub["_date"] = pd.to_datetime(sub["Eintrittsdatum"], format="%Y%m%d", errors="coerce")
+
+    return sub.sort_values(["Referenzjahr", "Phase_id"]).reset_index(drop=True)
