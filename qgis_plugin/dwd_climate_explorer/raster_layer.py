@@ -10,8 +10,10 @@ from qgis.core import (
 )
 from qgis.analysis import QgsRasterCalculator, QgsRasterCalculatorEntry
 from qgis.PyQt.QtGui import QColor
+import numpy as np
 
 from . import dwd_client as c
+from . import timeline as tl
 
 GRID_CRS = "EPSG:31467"  # DHDN / Gauss-Kruger zone 3, used by all DWD multi_annual grids
 
@@ -82,7 +84,8 @@ def _style_delta_layer(layer):
 def add_or_replace_raster_layer(asc_path, variable, period, year_code):
     project = QgsProject.instance()
     for lyr in list(project.mapLayers().values()):
-        if isinstance(lyr, QgsRasterLayer) and lyr.name().startswith("DWD "):
+        if (isinstance(lyr, QgsRasterLayer) and lyr.name().startswith("DWD ")
+                and not lyr.customProperty(tl.SERIES_PROP)):
             project.removeMapLayer(lyr.id())
     layer = load_raster_grid(asc_path, variable, period, year_code)
     project.addMapLayer(layer)
@@ -124,6 +127,18 @@ def compute_delta_grid(asc_path_a, asc_path_b, dest_tif_path):
     return dest_tif_path
 
 
+def series_value_range(layers):
+    """Common min/max across a timeline series, so every step shares one
+    colour scale and the steps are visually comparable."""
+    lo, hi = None, None
+    for layer in layers:
+        stats = layer.dataProvider().bandStatistics(
+            1, Qgis.RasterBandStatistic.Min | Qgis.RasterBandStatistic.Max)
+        lo = stats.minimumValue if lo is None else min(lo, stats.minimumValue)
+        hi = stats.maximumValue if hi is None else max(hi, stats.maximumValue)
+    return lo, hi
+
+
 def add_or_replace_delta_layer(tif_path, variable, period, year_code_a, year_code_b):
     meta = c.RASTER_CATALOGUE[variable]
     layer_name = (f"DWD {meta['label']} change - {c.PERIOD_LABELS[period]} "
@@ -136,6 +151,67 @@ def add_or_replace_delta_layer(tif_path, variable, period, year_code_a, year_cod
     project = QgsProject.instance()
     for lyr in list(project.mapLayers().values()):
         if isinstance(lyr, QgsRasterLayer) and lyr.name().startswith("DWD ") and "change" in lyr.name():
+            project.removeMapLayer(lyr.id())
+    project.addMapLayer(layer)
+    return layer
+
+
+# ---------------------------------------------------------------------------
+# RADOLAN
+# ---------------------------------------------------------------------------
+RADOLAN_NODATA = -1.0
+
+
+def radolan_crs():
+    return QgsCoordinateReferenceSystem.fromProj(c.RADOLAN_PROJ4)
+
+
+def write_radolan_geotiff(path, values):
+    """Writes one north-up RADOLAN array (mm, NaN = no radar coverage) as a
+    compressed single-band GeoTIFF with the RADOLAN stereographic CRS
+    embedded, so the file is self-describing for Processing outputs too."""
+    from osgeo import gdal, osr
+    nrows, ncols = values.shape
+    ds = gdal.GetDriverByName("GTiff").Create(
+        path, ncols, nrows, 1, gdal.GDT_Float32,
+        options=["COMPRESS=DEFLATE", "PREDICTOR=3", "TILED=YES"])
+    ds.SetGeoTransform(c.RADOLAN_GEOTRANSFORM)
+    srs = osr.SpatialReference()
+    srs.ImportFromProj4(c.RADOLAN_PROJ4)
+    ds.SetProjection(srs.ExportToWkt())
+    band = ds.GetRasterBand(1)
+    band.SetNoDataValue(RADOLAN_NODATA)
+    band.WriteArray(np.where(np.isnan(values), RADOLAN_NODATA, values).astype(np.float32))
+    band.FlushCache()
+    ds = None  # closes + flushes the file
+    return path
+
+
+def radolan_colour_max(values, floor=1.0):
+    """Upper end of the colour ramp: the 99.9th percentile rather than the
+    max, so a single extreme cell doesn't wash out the rest of the map."""
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return floor
+    return max(floor, float(np.percentile(finite, 99.9)))
+
+
+def load_radolan_layer(tif_path, layer_name, vmax):
+    layer = QgsRasterLayer(tif_path, layer_name)
+    if not layer.isValid():
+        raise RuntimeError(f"GDAL could not read the RADOLAN grid: {tif_path}")
+    layer.setCrs(radolan_crs())
+    # 0 mm maps to the palette's fully transparent first colour, so dry
+    # areas show the basemap through, as on DWD's own radar maps.
+    _style_layer(layer, c.RADOLAN_PALETTE, vmin=0.0, vmax=vmax)
+    return layer
+
+
+def add_or_replace_radolan_layer(layer):
+    project = QgsProject.instance()
+    for lyr in list(project.mapLayers().values()):
+        if (isinstance(lyr, QgsRasterLayer) and lyr.name().startswith("RADOLAN ")
+                and not lyr.customProperty(tl.SERIES_PROP)):
             project.removeMapLayer(lyr.id())
     project.addMapLayer(layer)
     return layer

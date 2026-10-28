@@ -314,6 +314,54 @@ def plot_phenology_trend(fig, df, phase_id, year_range, station_name):
     fig.tight_layout()
 
 
+def plot_raster_timeline(fig, xs, values, title, location, ylabel, kind="line",
+                         bar_width=None, total_unit=None):
+    """Values of every grid in a timeline series at one picked map point.
+    `xs` are datetimes (RADOLAN) or step labels (climatology series, drawn
+    as a categorical axis); None in `values` = no data there (outside the
+    grid / no radar coverage) and is skipped, not drawn as zero. Datetimes
+    mark the END of each accumulation interval (DWD convention), so time
+    bars are drawn leftwards from x (negative width, edge-aligned)."""
+    fig.clear()
+    ax = fig.add_subplot(111)
+    pts = [(x, v) for x, v in zip(xs, values) if v is not None]
+    if not pts:
+        ax.text(0.5, 0.5, "No data at this location (outside the grid or no radar coverage).",
+                ha="center", va="center", color="#888888")
+        ax.set_axis_off()
+        return
+    is_time = not isinstance(xs[0], str)
+    px = [x for x, _ in pts] if is_time else list(range(len(xs)))
+    py = [v for _, v in pts] if is_time else [np.nan if v is None else v for v in values]
+
+    if kind == "bar":
+        width = -bar_width if (is_time and bar_width) else 0.8
+        ax.bar(px, py, width=width, align="edge" if is_time else "center",
+               color=COL_PRECIP, edgecolor="none")
+    else:
+        ax.plot(px, py, color=COL_TEMP, lw=1.8, marker="o", ms=5)
+
+    if not is_time:
+        ax.set_xticks(range(len(xs)))
+        long_labels = max(len(x) for x in xs) > 4
+        ax.set_xticklabels(xs, rotation=30 if long_labels else 0,
+                           ha="right" if long_labels else "center")
+    else:
+        fig.autofmt_xdate()
+
+    if total_unit:
+        total = float(np.nansum(py))
+        ax.legend(handles=[_dummy_patch(COL_PRECIP, f"Total: {total:.1f} {total_unit}  |  "
+                                                    f"max: {np.nanmax(py):.1f} {total_unit}")],
+                  loc="upper left", fontsize=8, frameon=False)
+
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{title}\n{location}", loc="left", fontsize=11)
+    ax.grid(axis="y", color="#eeeeee")
+    _attribute(ax)
+    fig.tight_layout()
+
+
 def _dummy_line(color, label):
     from matplotlib.lines import Line2D
     return Line2D([0], [0], color=color, lw=2, label=label)

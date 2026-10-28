@@ -10,15 +10,19 @@ mean QGIS's UI is briefly non-interactive while a fetch is in flight.
 """
 import os
 import tempfile
+from datetime import date, datetime, timedelta, timezone
 
+import pandas as pd
 import requests
-from qgis.PyQt.QtCore import Qt, QCoreApplication
+from qgis.core import QgsProject
+from qgis.gui import QgsVertexMarker
+from qgis.PyQt.QtCore import Qt, QCoreApplication, QDate
 from qgis.PyQt.QtGui import QColor, QPixmap, QPainter
 from qgis.PyQt.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout,
     QTabWidget, QPushButton, QLabel, QLineEdit, QDoubleSpinBox, QSpinBox,
     QRadioButton, QButtonGroup, QComboBox, QTextBrowser, QGroupBox,
-    QFileDialog, QApplication, QStackedWidget,
+    QFileDialog, QApplication, QStackedWidget, QCheckBox, QDateEdit, QScrollArea,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
@@ -28,11 +32,13 @@ from . import plotting as p
 from . import station_layer as sl
 from . import raster_layer as rl
 from . import pheno_layer as pl
+from . import timeline as tl
 from . import report
 from .range_slider import RangeSlider
 
 CURRENT_YEAR = 2026
 PHENO_REPORTER_KEYS = ["annual", "immediate"]
+RADOLAN_CACHE_DIR = os.path.join(tempfile.gettempdir(), "dwd_radolan")
 
 
 def _swatch(colour):
@@ -45,6 +51,21 @@ def _swatch(colour):
     painter.drawEllipse(1, 1, 10, 10)
     painter.end()
     return pix
+
+
+def _scrollable(widget):
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    area.setWidget(widget)
+    return area
+
+
+def _qdate(d):
+    return QDate(d.year, d.month, d.day)
+
+
+def _pydate(qd):
+    return date(qd.year(), qd.month(), qd.day())
 
 
 class PlotPanel(QWidget):
@@ -93,8 +114,26 @@ class DWDDockWidget(QDockWidget):
 
         self.pheno_pick_tool = sl.StationPickTool(self.canvas, lambda: self.pheno_station_layer_obj)
         self.pheno_pick_tool.stationPicked.connect(self.on_pheno_station_picked)
+        # All-station records of the current species, shared by the per-station
+        # chart and the observation map so switching between them never
+        # re-downloads the (multi-MB) species file.
+        self.pheno_records = None
+        self.pheno_records_key = None       # (reporter, category, species_token)
+
+        # -- Timeline state ---------------------------------------------------
+        self.timeline_series = {}           # series_id -> dict, see _register_timeline_series
+        self.timeline_point = None          # (QgsPointXY, canvas CRS) of the last pick
+        self.timeline_last = None           # DataFrame of the last chart, for CSV export
+        self.timeline_marker = None         # QgsVertexMarker at the picked point
+        self.timeline_pick_tool = tl.PointPickTool(self.canvas)
+        self.timeline_pick_tool.pointPicked.connect(self.on_timeline_point_picked)
 
         self._build_ui()
+
+        for tool, button in ((self.pick_tool, self.btn_pick_tool),
+                             (self.pheno_pick_tool, self.btn_pheno_pick_tool),
+                             (self.timeline_pick_tool, self.btn_timeline_pick)):
+            tool.deactivated.connect(lambda b=button: self._uncheck_silently(b))
 
     # ------------------------------------------------------------------
     # UI construction
@@ -109,7 +148,12 @@ class DWDDockWidget(QDockWidget):
         self.tabs.addTab(self._build_stations_tab(), "Stations")
         self.tabs.addTab(self._build_climate_tab(), "Climate")
         self.tabs.addTab(self._build_raster_tab(), "Raster Grids")
-        self.tabs.addTab(self._build_phenology_tab(), "Phenology")
+        self.tabs.addTab(self._build_radolan_tab(), "RADOLAN")
+        self.pheno_tab = _scrollable(self._build_phenology_tab())
+        self.tabs.addTab(self.pheno_tab, "Phenology")
+        self.timeline_tab = self._build_timeline_tab()
+        self.tabs.addTab(self.timeline_tab, "Timeline")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self.setWidget(root)
 
@@ -414,6 +458,16 @@ class DWDDockWidget(QDockWidget):
             self.raster_year_combo.addItem(label, key)
         self.raster_year_combo.setCurrentIndex(len(c.YEAR_RANGE_LABELS) - 1)
         form.addRow("Reference period:", self.raster_year_combo)
+
+        self.raster_timeline_check = QCheckBox(
+            "Timeline: load a series of grids, then click the map for a chart")
+        form.addRow(self.raster_timeline_check)
+        self.raster_series_combo = QComboBox()
+        self.raster_series_combo.addItem("All reference periods (for the period above)", "periods")
+        self.raster_series_combo.addItem("12 months (of the reference period above)", "months")
+        self.raster_series_combo.setEnabled(False)
+        form.addRow("Series over:", self.raster_series_combo)
+        self.raster_timeline_check.toggled.connect(self.raster_series_combo.setEnabled)
         layout.addLayout(form)
 
         self.raster_var_combo.currentIndexChanged.connect(self._update_raster_periods)
@@ -461,6 +515,116 @@ class DWDDockWidget(QDockWidget):
         layout.addStretch(1)
         return w
 
+    def _build_radolan_tab(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        info = QLabel(
+            "RADOLAN: radar-based, rain-gauge-adjusted precipitation for all of Germany on a "
+            "1km x 1km grid (2005 onwards). Times are UTC and mark the end of each "
+            "accumulation interval. Recent days download quickly; dates before the current "
+            "'recent' window come from monthly archives (~40 MB each, cached in the temp folder)."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        self.radolan_product_combo = QComboBox()
+        for key, meta in c.RADOLAN_PRODUCTS.items():
+            self.radolan_product_combo.addItem(meta["label"], key)
+        self.radolan_product_combo.setCurrentIndex(list(c.RADOLAN_PRODUCTS).index("SF"))
+        form.addRow("Product:", self.radolan_product_combo)
+
+        self.radolan_timeline_check = QCheckBox(
+            "Timeline: date range as time-aware layers, click the map for a chart")
+        form.addRow(self.radolan_timeline_check)
+
+        yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+        self.radolan_start_label = QLabel("Date (UTC):")
+        self.radolan_start_edit = QDateEdit(_qdate(yesterday))
+        self.radolan_end_label = QLabel("End date (UTC):")
+        self.radolan_end_edit = QDateEdit(_qdate(yesterday))
+        for edit in (self.radolan_start_edit, self.radolan_end_edit):
+            edit.setCalendarPopup(True)
+            edit.setDisplayFormat("yyyy-MM-dd")
+            edit.setDateRange(QDate(2005, 1, 1), _qdate(yesterday))
+        form.addRow(self.radolan_start_label, self.radolan_start_edit)
+        form.addRow(self.radolan_end_label, self.radolan_end_edit)
+
+        self.radolan_hour_label = QLabel("Hour ending (UTC):")
+        self.radolan_hour_spin = QSpinBox()
+        self.radolan_hour_spin.setRange(0, 23)
+        self.radolan_hour_spin.setValue(12)
+        self.radolan_hour_spin.setSuffix(":50")
+        form.addRow(self.radolan_hour_label, self.radolan_hour_spin)
+        layout.addLayout(form)
+
+        self.radolan_product_combo.currentIndexChanged.connect(self._update_radolan_inputs)
+        self.radolan_timeline_check.toggled.connect(self._update_radolan_inputs)
+        self._update_radolan_inputs()
+
+        self.btn_load_radolan = QPushButton("Load RADOLAN")
+        self.btn_load_radolan.clicked.connect(self.on_load_radolan)
+        layout.addWidget(self.btn_load_radolan)
+
+        self.radolan_status_label = QLabel("")
+        self.radolan_status_label.setWordWrap(True)
+        layout.addWidget(self.radolan_status_label)
+
+        layout.addStretch(1)
+        return w
+
+    def _update_radolan_inputs(self, *_):
+        product = self.radolan_product_combo.currentData()
+        timeline = self.radolan_timeline_check.isChecked()
+        self.radolan_start_label.setText("Start date (UTC):" if timeline else "Date (UTC):")
+        for wdg in (self.radolan_end_label, self.radolan_end_edit):
+            wdg.setVisible(timeline)
+        for wdg in (self.radolan_hour_label, self.radolan_hour_spin):
+            wdg.setVisible(product == "RW" and not timeline)
+
+    def _build_timeline_tab(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        info = QLabel(
+            "Raster series loaded with 'Timeline' ticked (Raster Grids or RADOLAN tab) are "
+            "listed here. With 'Pick point on map' on, click anywhere on the canvas to chart "
+            "the value of every grid in the series at that spot. RADOLAN timelines are also "
+            "time-aware layers: View > Panels > Temporal Controller animates them."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Series:"))
+        self.timeline_combo = QComboBox()
+        row.addWidget(self.timeline_combo, 1)
+        layout.addLayout(row)
+
+        btn_row = QHBoxLayout()
+        self.btn_timeline_pick = QPushButton("Pick point on map")
+        self.btn_timeline_pick.setCheckable(True)
+        self.btn_timeline_pick.setEnabled(False)
+        self.btn_timeline_pick.toggled.connect(
+            lambda checked: self._toggle_map_tool(self.btn_timeline_pick, self.timeline_pick_tool, checked))
+        btn_row.addWidget(self.btn_timeline_pick)
+        self.btn_download_timeline = QPushButton("Download CSV")
+        self.btn_download_timeline.setEnabled(False)
+        self.btn_download_timeline.clicked.connect(self.on_download_timeline)
+        btn_row.addWidget(self.btn_download_timeline)
+        layout.addLayout(btn_row)
+
+        self.timeline_status_label = QLabel("No timeline series loaded yet.")
+        self.timeline_status_label.setWordWrap(True)
+        layout.addWidget(self.timeline_status_label)
+
+        self.timeline_panel = PlotPanel()
+        layout.addWidget(self.timeline_panel)
+
+        self.timeline_combo.currentIndexChanged.connect(self._redraw_timeline)
+        return w
+
     def _build_phenology_tab(self):
         w = QWidget()
         layout = QVBoxLayout(w)
@@ -497,6 +661,51 @@ class DWDDockWidget(QDockWidget):
 
         self.pheno_reporter_group.idClicked.connect(self.on_pheno_reporter_changed)
         self.pheno_category_combo.currentIndexChanged.connect(self.on_pheno_category_changed)
+        self.pheno_species_combo.currentIndexChanged.connect(self._reset_pheno_obs_phases)
+
+        obs_box = QGroupBox("Observation map (all stations)")
+        obs_layout = QVBoxLayout(obs_box)
+        obs_info = QLabel(
+            "Maps one phase's entry date at every station as a point layer coloured by day of "
+            "year. The layer is time-aware: in the Temporal Controller each observation appears "
+            "on its entry date and stays until the end of that year, so animating a spring "
+            "shows e.g. flowering spreading across Germany."
+        )
+        obs_info.setWordWrap(True)
+        obs_layout.addWidget(obs_info)
+
+        obs_form = QFormLayout()
+        phase_row = QHBoxLayout()
+        self.pheno_obs_phase_combo = QComboBox()
+        phase_row.addWidget(self.pheno_obs_phase_combo, 1)
+        self.btn_pheno_obs_phases = QPushButton("Load phases")
+        self.btn_pheno_obs_phases.clicked.connect(self.on_load_pheno_obs_phases)
+        phase_row.addWidget(self.btn_pheno_obs_phases)
+        obs_form.addRow("Phase:", phase_row)
+
+        years_row = QHBoxLayout()
+        self.pheno_obs_from_spin = QSpinBox()
+        self.pheno_obs_to_spin = QSpinBox()
+        for spin, value in ((self.pheno_obs_from_spin, CURRENT_YEAR - 29),
+                            (self.pheno_obs_to_spin, CURRENT_YEAR)):
+            spin.setRange(1900, CURRENT_YEAR)
+            spin.setValue(value)
+        years_row.addWidget(self.pheno_obs_from_spin)
+        years_row.addWidget(QLabel("to"))
+        years_row.addWidget(self.pheno_obs_to_spin)
+        years_row.addStretch(1)
+        obs_form.addRow("Years:", years_row)
+        obs_layout.addLayout(obs_form)
+
+        self.btn_pheno_obs_map = QPushButton("Add observation layer to map")
+        self.btn_pheno_obs_map.clicked.connect(self.on_add_pheno_obs_layer)
+        obs_layout.addWidget(self.btn_pheno_obs_map)
+
+        self.pheno_obs_status_label = QLabel("")
+        self.pheno_obs_status_label.setWordWrap(True)
+        obs_layout.addWidget(self.pheno_obs_status_label)
+
+        layout.addWidget(obs_box)
 
         loc_box = QGroupBox("Station")
         loc_layout = QVBoxLayout(loc_box)
@@ -589,6 +798,7 @@ class DWDDockWidget(QDockWidget):
         layout.addWidget(self.pheno_range)
 
         self.pheno_panel = PlotPanel()
+        self.pheno_panel.setMinimumHeight(360)  # the tab scrolls, so give the chart real height
         layout.addWidget(self.pheno_panel)
 
         self.pheno_phase_combo.currentIndexChanged.connect(self._redraw_pheno)
@@ -658,14 +868,27 @@ class DWDDockWidget(QDockWidget):
         self.btn_pick_tool.setEnabled(True)
 
     def on_toggle_pick_tool(self, checked):
+        self._toggle_map_tool(self.btn_pick_tool, self.pick_tool, checked)
+
+    def _toggle_map_tool(self, button, tool, checked):
+        """Shared by all three pick buttons: only one can be active, and
+        unchecking restores whatever map tool was active before -- unless
+        the user has meanwhile switched to another tool themselves."""
         if checked:
-            if self.btn_pheno_pick_tool.isChecked():
-                self.btn_pheno_pick_tool.setChecked(False)
+            for other in (self.btn_pick_tool, self.btn_pheno_pick_tool, self.btn_timeline_pick):
+                if other is not button and other.isChecked():
+                    other.setChecked(False)
             self._prev_map_tool = self.canvas.mapTool()
-            self.canvas.setMapTool(self.pick_tool)
-        else:
-            if self._prev_map_tool is not None:
-                self.canvas.setMapTool(self._prev_map_tool)
+            self.canvas.setMapTool(tool)
+        elif self.canvas.mapTool() is tool and self._prev_map_tool is not None:
+            self.canvas.setMapTool(self._prev_map_tool)
+
+    def _uncheck_silently(self, button):
+        """A pick tool was replaced by another map tool (e.g. the user
+        clicked Pan): reflect that on its button without restoring anything."""
+        button.blockSignals(True)
+        button.setChecked(False)
+        button.blockSignals(False)
 
     def on_station_picked(self, station_id):
         if self.index is None:
@@ -956,6 +1179,9 @@ class DWDDockWidget(QDockWidget):
         year_code = self.raster_year_combo.currentData()
         if not period:
             return
+        if self.raster_timeline_check.isChecked():
+            self._load_raster_timeline(variable, period, year_code)
+            return
 
         self.raster_status_label.setText("Downloading raster grid...")
         QCoreApplication.processEvents()
@@ -1033,6 +1259,225 @@ class DWDDockWidget(QDockWidget):
             f"Range: {stats.minimumValue:+.1f} to {stats.maximumValue:+.1f} {meta['unit']}"
         )
 
+    def _load_raster_timeline(self, variable, period, year_code):
+        """Multi-annual grids have no real dates, so this series is not made
+        time-aware -- it is a layer group (last step visible) whose steps
+        are point-sampled from the Timeline tab."""
+        meta = c.RASTER_CATALOGUE[variable]
+        kind = self.raster_series_combo.currentData()
+        if kind == "months":
+            if meta["periods"] == "annual_only":
+                self._warn(f"{meta['label']} only exists as an annual grid -- choose "
+                           f"'All reference periods' instead.")
+                return
+            steps = [(f"{m:02d}", year_code, c.PERIOD_LABELS[f"{m:02d}"][:3]) for m in range(1, 13)]
+            title = f"{meta['label']} - monthly cycle {c.YEAR_RANGE_LABELS[year_code]}"
+        else:
+            steps = [(period, yc, label) for yc, label in c.YEAR_RANGE_LABELS.items()]
+            title = f"{meta['label']} - {c.PERIOD_LABELS[period]}, all reference periods"
+
+        layers = []
+        for i, (per, yc, label) in enumerate(steps):
+            self.raster_status_label.setText(f"Downloading {label} ({i + 1}/{len(steps)})...")
+            QCoreApplication.processEvents()
+            dest = os.path.join(tempfile.gettempdir(), f"dwd_{variable}_{per}_{yc}.asc")
+            try:
+                self._run_busy(c.fetch_raster_grid, variable, per, yc, dest, session=self.session)
+                layers.append(rl.load_raster_grid(dest, variable, per, yc))
+            except Exception as e:
+                self._error(f"Could not download raster grid ({label}): {e}")
+                self.raster_status_label.setText("")
+                return
+
+        vmin, vmax = rl.series_value_range(layers)
+        for layer in layers:
+            rl._style_layer(layer, meta["palette"], vmin=vmin, vmax=vmax)
+        series_id = f"grid:{variable}:{kind}:{year_code if kind == 'months' else period}"
+        tl.add_series_group(layers, f"DWD timeline: {title}", series_id, only_last_visible=True)
+        self.canvas.setExtent(self.canvas.mapSettings().layerExtentToOutputExtent(
+            layers[-1], layers[-1].extent()))
+        self.canvas.refresh()
+
+        self.raster_status_label.setText(
+            f"{title}: {len(layers)} grids loaded, common scale {vmin:.1f} to {vmax:.1f} "
+            f"{meta['unit']}. Click the map to chart a point (Timeline tab).")
+        self._register_timeline_series(
+            series_id, title, layers, [label for _, _, label in steps],
+            ylabel=f"{meta['label']} [{meta['unit']}]",
+            kind="line" if variable in c.TEMPERATURE_VARIABLES else "bar",
+            total_unit=meta["unit"] if kind == "months" and meta["unit"] in ("mm", "h") else None)
+
+    # ------------------------------------------------------------------
+    # RADOLAN tab
+    # ------------------------------------------------------------------
+    def _radolan_progress(self, i, n, msg):
+        self.radolan_status_label.setText(f"{msg} ({i + 1}/{n})")
+        QCoreApplication.processEvents()
+
+    def on_load_radolan(self):
+        product = self.radolan_product_combo.currentData()
+        meta = c.RADOLAN_PRODUCTS[product]
+        timeline = self.radolan_timeline_check.isChecked()
+        start = _pydate(self.radolan_start_edit.date())
+        if timeline:
+            end = _pydate(self.radolan_end_edit.date())
+            n_days = (end - start).days + 1
+            if n_days < 1:
+                self._warn("The end date is before the start date.")
+                return
+            if n_days > meta["max_days"]:
+                self._warn(f"{meta['label']}: a timeline can span at most {meta['max_days']} days "
+                           f"({n_days} selected).")
+                return
+            hour = None
+        else:
+            end = start
+            hour = self.radolan_hour_spin.value() if product == "RW" else None
+
+        os.makedirs(RADOLAN_CACHE_DIR, exist_ok=True)
+        grids = []  # (start_dt, end_dt, tif_path)
+        vmax = 0.0
+
+        def download():
+            nonlocal vmax
+            for g in c.iter_radolan_grids(product, start, end, hour=hour, session=self.session,
+                                          cache_dir=RADOLAN_CACHE_DIR,
+                                          progress_cb=self._radolan_progress):
+                path = os.path.join(RADOLAN_CACHE_DIR, f"radolan_{product}_{g['end']:%Y%m%d%H%M}.tif")
+                rl.write_radolan_geotiff(path, g["data"])
+                vmax = max(vmax, rl.radolan_colour_max(g["data"]))
+                grids.append((g["start"], g["end"], path))
+
+        self.btn_load_radolan.setEnabled(False)
+        try:
+            self._run_busy(download)
+        except Exception as e:
+            self._error(f"Could not load RADOLAN data: {e}")
+            self.radolan_status_label.setText("")
+            return
+        finally:
+            self.btn_load_radolan.setEnabled(True)
+        if not grids:
+            self._warn("No RADOLAN grids found for that selection.")
+            self.radolan_status_label.setText("")
+            return
+
+        def label(end_dt):
+            if product == "SF":
+                return f"{end_dt:%Y-%m-%d} (24h to 23:50 UTC)"
+            return f"{end_dt:%Y-%m-%d %H:%M} UTC"
+
+        layers = [rl.load_radolan_layer(path, f"RADOLAN {product} {label(e)}", vmax)
+                  for _s, e, path in grids]
+
+        if not timeline:
+            layer = rl.add_or_replace_radolan_layer(layers[0])
+            self.canvas.setExtent(self.canvas.mapSettings().layerExtentToOutputExtent(
+                layer, layer.extent()))
+            self.canvas.refresh()
+            self.radolan_status_label.setText(
+                f"{meta['label']}, {label(grids[0][1])}. Colour scale 0 to {vmax:.1f} mm.")
+            return
+
+        for layer, (s, e, _path) in zip(layers, grids):
+            tl.set_raster_time_range(layer, s, e)
+        title = f"RADOLAN {product} {start:%Y-%m-%d} to {end:%Y-%m-%d}"
+        series_id = f"radolan:{product}:{start:%Y%m%d}:{end:%Y%m%d}"
+        tl.add_series_group(layers, f"RADOLAN timeline: {meta['label']}, "
+                                    f"{start:%Y-%m-%d} to {end:%Y-%m-%d}", series_id)
+        animated = tl.configure_temporal_controller(
+            self.canvas, grids[0][0], grids[-1][1], meta["step_hours"] * 3600)
+        self.canvas.setExtent(self.canvas.mapSettings().layerExtentToOutputExtent(
+            layers[0], layers[0].extent()))
+        self.canvas.refresh()
+
+        self.radolan_status_label.setText(
+            f"{title}: {len(layers)} time-aware grids, common colour scale 0 to {vmax:.1f} mm. "
+            + ("Temporal Controller set to animate them (View > Panels > Temporal Controller). "
+               if animated else "")
+            + "Click the map to chart a point (Timeline tab).")
+        self._register_timeline_series(
+            series_id, f"{meta['label']}, {start:%Y-%m-%d} to {end:%Y-%m-%d}", layers,
+            [e for _s, e, _p in grids], ylabel="Precipitation [mm]", kind="bar",
+            bar_width=meta["step_hours"] / 24.0, total_unit="mm")
+
+    # ------------------------------------------------------------------
+    # Timeline tab
+    # ------------------------------------------------------------------
+    def _register_timeline_series(self, series_id, title, layers, xs, ylabel, kind,
+                                  bar_width=None, total_unit=None):
+        """Makes a freshly loaded series pickable: lists it in the Timeline
+        tab, switches there and turns the point picker on -- ticking
+        'Timeline' is the user's signal that they want to click the map."""
+        self.timeline_series[series_id] = dict(
+            title=title, layer_ids=[layer.id() for layer in layers], xs=xs, ylabel=ylabel,
+            kind=kind, bar_width=bar_width, total_unit=total_unit)
+        idx = self.timeline_combo.findData(series_id)
+        if idx < 0:
+            self.timeline_combo.addItem(title, series_id)
+            idx = self.timeline_combo.count() - 1
+        if idx == self.timeline_combo.currentIndex():
+            self._redraw_timeline()  # same entry reloaded: refresh with the new layer ids
+        else:
+            self.timeline_combo.setCurrentIndex(idx)
+        self.btn_timeline_pick.setEnabled(True)
+        if self.timeline_point is None:
+            self.timeline_status_label.setText("Click anywhere on the map to chart this series.")
+        self.tabs.setCurrentWidget(self.timeline_tab)
+        if not self.btn_timeline_pick.isChecked():
+            self.btn_timeline_pick.setChecked(True)
+
+    def on_timeline_point_picked(self, point):
+        self.timeline_point = (point, self.canvas.mapSettings().destinationCrs())
+        if self.timeline_marker is None:
+            self.timeline_marker = QgsVertexMarker(self.canvas)
+            self.timeline_marker.setIconType(QgsVertexMarker.ICON_CROSS)
+            self.timeline_marker.setColor(QColor("#d62728"))
+            self.timeline_marker.setIconSize(16)
+            self.timeline_marker.setPenWidth(3)
+        self.timeline_marker.setCenter(point)
+        self._redraw_timeline()
+
+    def _redraw_timeline(self, *_):
+        series_id = self.timeline_combo.currentData()
+        series = self.timeline_series.get(series_id)
+        if series is None or self.timeline_point is None:
+            return
+        project = QgsProject.instance()
+        if all(project.mapLayer(lid) is None for lid in series["layer_ids"]):
+            # The user deleted the group from the layer tree.
+            del self.timeline_series[series_id]
+            self.timeline_combo.removeItem(self.timeline_combo.currentIndex())
+            self._warn(f"The layers of '{series['title']}' were removed from the project.")
+            if self.timeline_combo.count() == 0:
+                self.btn_timeline_pick.setChecked(False)
+                self.btn_timeline_pick.setEnabled(False)
+            return
+
+        point, crs = self.timeline_point
+        values = self._run_busy(tl.sample_layers, series["layer_ids"], point, crs)
+        lat, lon = tl.to_wgs84(point, crs)
+        p.plot_raster_timeline(
+            self.timeline_panel.figure, series["xs"], values, series["title"],
+            f"Point {lat:.4f}°N, {lon:.4f}°E", series["ylabel"], kind=series["kind"],
+            bar_width=series["bar_width"], total_unit=series["total_unit"])
+        self.timeline_panel.redraw()
+
+        n_valid = sum(v is not None for v in values)
+        self.timeline_status_label.setText(
+            f"{n_valid} of {len(values)} grids have data at {lat:.4f}°N, {lon:.4f}°E.")
+        self.timeline_last = pd.DataFrame({
+            "step": series["xs"], "value": values, "lat": lat, "lon": lon,
+        })
+        self.btn_download_timeline.setEnabled(n_valid > 0)
+
+    def on_download_timeline(self):
+        if self.timeline_last is None:
+            self._warn("Pick a point on the map first.")
+            return
+        lat, lon = self.timeline_last["lat"].iloc[0], self.timeline_last["lon"].iloc[0]
+        self._save_csv(self.timeline_last, "timeline", station_name=f"{lat:.3f}N_{lon:.3f}E")
+
     # ------------------------------------------------------------------
     # Phenology tab
     # ------------------------------------------------------------------
@@ -1050,11 +1495,19 @@ class DWDDockWidget(QDockWidget):
         self.pheno_species_combo.clear()
         self.pheno_species_index = None
 
+    def _on_tab_changed(self, _index):
+        # The first category is pre-selected without a change signal, so its
+        # species would otherwise never load (selecting the already-current
+        # entry fires nothing). Load it the first time the tab is shown.
+        if self.tabs.currentWidget() is self.pheno_tab and self.pheno_species_combo.count() == 0:
+            self.on_pheno_category_changed()
+
     def on_pheno_reporter_changed(self, _id):
         self.pheno_stations_df = None
         self.pheno_selected_station = None
         self.btn_pheno_pick_tool.setEnabled(False)
         self._populate_pheno_categories()
+        self.on_pheno_category_changed()
 
     def on_pheno_category_changed(self, *_):
         reporter = PHENO_REPORTER_KEYS[self.pheno_reporter_group.checkedId()]
@@ -1100,14 +1553,7 @@ class DWDDockWidget(QDockWidget):
         self.btn_pheno_pick_tool.setEnabled(True)
 
     def on_toggle_pheno_pick_tool(self, checked):
-        if checked:
-            if self.btn_pick_tool.isChecked():
-                self.btn_pick_tool.setChecked(False)
-            self._prev_map_tool = self.canvas.mapTool()
-            self.canvas.setMapTool(self.pheno_pick_tool)
-        else:
-            if self._prev_map_tool is not None:
-                self.canvas.setMapTool(self._prev_map_tool)
+        self._toggle_map_tool(self.btn_pheno_pick_tool, self.pheno_pick_tool, checked)
 
     def on_pheno_station_picked(self, station_id):
         if self.pheno_stations_df is None:
@@ -1168,21 +1614,19 @@ class DWDDockWidget(QDockWidget):
             self._error(f"Location lookup failed: {e}")
             return
 
-        reporter = PHENO_REPORTER_KEYS[self.pheno_reporter_group.checkedId()]
-        category = self.pheno_category_combo.currentData()
         self.pheno_status_label.setText(
             f"Fetching {self.pheno_species_combo.currentText()} data for {station_row['Stationsname']}...")
         QCoreApplication.processEvents()
         try:
-            df = self._run_busy(
-                c.fetch_phenology_species_data, reporter, category, species_token,
-                int(station_row["Stations_id"]), session=self.session,
-                species_index=self.pheno_species_index,
-            )
+            records = self._run_busy(self._pheno_species_records)
         except Exception as e:
             self._error(f"Could not fetch phenology data: {e}")
             self.pheno_status_label.setText("")
             return
+        if records is None:
+            df = None
+        else:
+            df = records[records["Stations_id"] == int(station_row["Stations_id"])].reset_index(drop=True)
 
         self.pheno_selected_station = station_row
         self.pheno_data = df
@@ -1223,6 +1667,99 @@ class DWDDockWidget(QDockWidget):
                                 self.pheno_range.values(), self.pheno_selected_station["Stationsname"])
         self.pheno_panel.redraw()
 
+    def _pheno_species_records(self):
+        """All-station records of the selected species (lookups joined),
+        downloaded once per (reporter, category, species) and then reused."""
+        reporter = PHENO_REPORTER_KEYS[self.pheno_reporter_group.checkedId()]
+        category = self.pheno_category_combo.currentData()
+        token = self.pheno_species_combo.currentData()
+        key = (reporter, category, token)
+        if self.pheno_records_key != key:
+            self.pheno_records = c.fetch_phenology_species_data(
+                reporter, category, token, None, session=self.session,
+                species_index=self.pheno_species_index)
+            self.pheno_records_key = key
+        return self.pheno_records
+
+    def _reset_pheno_obs_phases(self, *_):
+        self.pheno_obs_phase_combo.clear()
+        self.pheno_obs_status_label.setText("")
+
+    def on_load_pheno_obs_phases(self):
+        if self.pheno_species_combo.count() == 0:
+            self.on_pheno_category_changed()
+        if self.pheno_species_combo.currentData() is None:
+            self._warn("No species selected.")
+            return False
+        self.pheno_obs_status_label.setText(
+            f"Downloading all {self.pheno_species_combo.currentText()} observations...")
+        QCoreApplication.processEvents()
+        try:
+            records = self._run_busy(self._pheno_species_records)
+        except Exception as e:
+            self._error(f"Could not fetch phenology data: {e}")
+            self.pheno_obs_status_label.setText("")
+            return False
+        self.pheno_obs_phase_combo.clear()
+        if records is None or len(records) == 0:
+            self.pheno_obs_status_label.setText("No observations for this species.")
+            return False
+
+        summary = (records.groupby(["Phase_id", "Phase_de"])
+                   .agg(n=("Stations_id", "size"), stations=("Stations_id", "nunique"))
+                   .reset_index().sort_values("Phase_id"))
+        for row in summary.itertuples(index=False):
+            self.pheno_obs_phase_combo.addItem(
+                f"{row.Phase_de} ({row.n} obs., {row.stations} stations)", int(row.Phase_id))
+
+        lo, hi = int(records["Referenzjahr"].min()), int(records["Referenzjahr"].max())
+        for spin in (self.pheno_obs_from_spin, self.pheno_obs_to_spin):
+            spin.setRange(lo, hi)
+        self.pheno_obs_from_spin.setValue(max(lo, hi - 29))
+        self.pheno_obs_to_spin.setValue(hi)
+        self.pheno_obs_status_label.setText(
+            f"{len(records)} observations, {lo}-{hi}. Choose a phase and add the layer.")
+        return True
+
+    def on_add_pheno_obs_layer(self):
+        if self.pheno_obs_phase_combo.count() == 0 and not self.on_load_pheno_obs_phases():
+            return
+        phase_id = self.pheno_obs_phase_combo.currentData()
+        y0, y1 = self.pheno_obs_from_spin.value(), self.pheno_obs_to_spin.value()
+        if y1 < y0:
+            self._warn("The end year is before the start year.")
+            return
+        try:
+            if self.pheno_stations_df is None:
+                reporter = PHENO_REPORTER_KEYS[self.pheno_reporter_group.checkedId()]
+                self.pheno_stations_df = self._run_busy(c.fetch_phenology_stations, reporter,
+                                                          session=self.session)
+            records = self._run_busy(self._pheno_species_records)
+        except Exception as e:
+            self._error(f"Could not fetch phenology data: {e}")
+            return
+        df = c.attach_pheno_station_coords(records, self.pheno_stations_df, phase_id, (y0, y1))
+        if df is None or len(df) == 0:
+            self.pheno_obs_status_label.setText(f"No observations of this phase in {y0}-{y1}.")
+            return
+
+        species = self.pheno_species_combo.currentText()
+        phase = df["Phase_de"].iloc[0]
+        layer = self._run_busy(pl.add_or_replace_pheno_obs_layer, df, f"{species} - {phase}, {y0}-{y1}")
+        self.canvas.setExtent(self.canvas.mapSettings().layerExtentToOutputExtent(
+            layer, layer.extent()))
+        # Extent + a weekly step for the Temporal Controller, but no forced
+        # animation: with the controller off, the layer is a static map of
+        # every observation, coloured by day of year.
+        tl.configure_temporal_controller(self.canvas, datetime(y0, 1, 1), datetime(y1, 12, 31, 23, 59),
+                                         7 * 86400, animate=False)
+        self.canvas.refresh()
+        median_doy = df["_date"].dt.dayofyear.median()
+        self.pheno_obs_status_label.setText(
+            f"{len(df)} observations at {df['Stations_id'].nunique()} stations, {y0}-{y1}. "
+            f"Median entry: day {median_doy:.0f} of the year. Animate via View > Panels > "
+            f"Temporal Controller.")
+
     def on_download_phenology(self):
         if self.pheno_data is None or len(self.pheno_data) == 0:
             self._warn("No phenology data loaded yet.")
@@ -1237,4 +1774,9 @@ class DWDDockWidget(QDockWidget):
             self.canvas.unsetMapTool(self.pick_tool)
         if self.canvas.mapTool() is self.pheno_pick_tool:
             self.canvas.unsetMapTool(self.pheno_pick_tool)
+        if self.canvas.mapTool() is self.timeline_pick_tool:
+            self.canvas.unsetMapTool(self.timeline_pick_tool)
+        if self.timeline_marker is not None:
+            self.canvas.scene().removeItem(self.timeline_marker)
+            self.timeline_marker = None
         super().closeEvent(event)

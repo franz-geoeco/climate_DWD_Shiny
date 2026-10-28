@@ -14,9 +14,12 @@ needed here).
 """
 import gzip
 import io
+import os
 import re
+import tarfile
+import tempfile
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -615,6 +618,15 @@ def _read_pheno_semicolon(session, url):
     return df
 
 
+def _int_id_column(df, col):
+    """The help files end with a DOS end-of-file byte (0x1A) that parses as
+    one extra junk row; drop any row whose id isn't a number."""
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=[col]).copy()
+    df[col] = df[col].astype(int)
+    return df
+
+
 def fetch_phase_lookup(session=None):
     """Global Phase_id -> name lookup, shared across every phenology
     category (not category-specific)."""
@@ -623,7 +635,7 @@ def fetch_phase_lookup(session=None):
     session = session or _session()
     df = _read_pheno_semicolon(session, PHENO_HELP_BASE + "PH_Beschreibung_Phase.txt")
     df = df.rename(columns={"Phase_ID": "Phase_id", "Phase": "Phase_de", "Phase_englisch": "Phase_en"})
-    df["Phase_id"] = df["Phase_id"].astype(int)
+    df = _int_id_column(df, "Phase_id")
     lookup = df.set_index("Phase_id")[["Phase_de", "Phase_en"]]
     _PHENO_LOOKUP_CACHE["phase"] = lookup
     return lookup
@@ -639,7 +651,7 @@ def fetch_plant_lookup(session=None):
         "Objekt_ID": "Objekt_id", "Objekt": "Objekt_de",
         "Objekt_englisch": "Objekt_en", "Objekt_latein": "Objekt_latin",
     })
-    df["Objekt_id"] = df["Objekt_id"].astype(int)
+    df = _int_id_column(df, "Objekt_id")
     lookup = df.set_index("Objekt_id")[["Objekt_de", "Objekt_en", "Objekt_latin"]]
     _PHENO_LOOKUP_CACHE["plant"] = lookup
     return lookup
@@ -665,7 +677,7 @@ def fetch_phenology_stations(reporter, session=None):
 def fetch_phenology_species_data(reporter, category, species_token, station_id,
                                   session=None, species_index=None):
     """Downloads + combines the historical and recent records for one
-    species, filters to one station, and joins the phase/plant name lookups
+    species, filters to one station (station_id=None keeps all), and joins the phase/plant name lookups
     (via the Phase_id/Objekt_id columns actually present in the data -- not
     guessed from the filename, which is far more robust). Overlapping
     (year, phase) rows keep the *recent* file's value, mirroring
@@ -702,13 +714,214 @@ def fetch_phenology_species_data(reporter, category, species_token, station_id,
         subset=["Stations_id", "Referenzjahr", "Phase_id"], keep="last")
     combined = combined.drop(columns=["_recent"])
 
-    sub = combined[combined["Stations_id"] == int(station_id)].copy()
+    if station_id is None:
+        sub = combined.copy()
+    else:
+        sub = combined[combined["Stations_id"] == int(station_id)].copy()
     if len(sub) == 0:
         return sub
 
-    sub = sub.join(fetch_phase_lookup(session=session), on="Phase_id")
-    sub = sub.join(fetch_plant_lookup(session=session), on="Objekt_id")
-    if "Eintrittsdatum" in sub.columns:
-        sub["_date"] = pd.to_datetime(sub["Eintrittsdatum"], format="%Y%m%d", errors="coerce")
+    return _finish_pheno_records(sub, session)
 
-    return sub.sort_values(["Referenzjahr", "Phase_id"]).reset_index(drop=True)
+
+def _finish_pheno_records(df, session):
+    df = df.join(fetch_phase_lookup(session=session), on="Phase_id")
+    df = df.join(fetch_plant_lookup(session=session), on="Objekt_id")
+    if "Eintrittsdatum" in df.columns:
+        df["_date"] = pd.to_datetime(df["Eintrittsdatum"], format="%Y%m%d", errors="coerce")
+    return df.sort_values(["Referenzjahr", "Phase_id"]).reset_index(drop=True)
+
+
+def fetch_phenology_observations(reporter, category, species_token, stations_df,
+                                 phase_id=None, year_range=None,
+                                 session=None, species_index=None):
+    """All-station variant of fetch_phenology_species_data(): every
+    observation of one species (optionally one phase / year range) joined to
+    the phenology station coordinates, ready to become a map layer."""
+    session = session or _session()
+    df = fetch_phenology_species_data(reporter, category, species_token, None,
+                                      session=session, species_index=species_index)
+    return attach_pheno_station_coords(df, stations_df, phase_id, year_range)
+
+
+def attach_pheno_station_coords(df, stations_df, phase_id=None, year_range=None):
+    """Filters all-station phenology records and joins station coordinates.
+    Rows whose station is missing from the station list (DWD keeps records
+    of stations that have since been dropped from the description file)
+    are discarded, since they cannot be placed on the map."""
+    if df is None or len(df) == 0:
+        return df
+    if phase_id is not None:
+        df = df[df["Phase_id"] == int(phase_id)]
+    if year_range is not None:
+        df = df[(df["Referenzjahr"] >= year_range[0]) & (df["Referenzjahr"] <= year_range[1])]
+    geo = stations_df[["Stations_id", "Stationsname", "geoBreite", "geoLaenge", "Bundesland"]]
+    df = df.merge(geo, on="Stations_id", how="inner")
+    return df.dropna(subset=["_date"]).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# RADOLAN (radar-based, gauge-adjusted precipitation, 1km x 1km, 900x900
+# national composite). Two products are exposed:
+#   RW -- hourly sums. Recent days ship as one RW-YYYYMMDD.tar.gz of 24
+#         ESRI-ASCII grids (values in 0.1 mm); older years only as monthly
+#         RW-YYYYMM.tar bundles of those same per-day archives.
+#   SF -- 24h sums ending 23:50 UTC, in RADOLAN's own binary format (which
+#         GDAL cannot read, hence decode_radolan_binary below). Only the
+#         recent/ folder is fetched for SF: the historical monthly SF
+#         bundles are ~190 MB each (they hold an SF grid for *every* hour),
+#         so for older dates the daily sum is rebuilt from that day's 24 RW
+#         grids instead -- same 23:50-to-23:50 window, and checked against
+#         real SF files to agree to within rounding.
+# All timestamps are UTC and mark the END of the accumulation interval.
+# ---------------------------------------------------------------------------
+RADOLAN_BASE = "https://opendata.dwd.de/climate_environment/CDC/grids_germany/"
+
+# Polar stereographic on a sphere, as defined in the RADOLAN format
+# description; the ASCII grids' xllcorner/yllcorner are in these metres.
+RADOLAN_PROJ4 = ("+proj=stere +lat_0=90 +lat_ts=60 +lon_0=10 +a=6370040 +b=6370040 "
+                 "+x_0=0 +y_0=0 +units=m +no_defs")
+RADOLAN_NCOLS = 900
+RADOLAN_NROWS = 900
+RADOLAN_XLL = -523462.0
+RADOLAN_YLL = -4658645.0
+RADOLAN_CELL = 1000.0
+# GDAL-style (x_topleft, dx, 0, y_topleft, 0, -dy), north-up.
+RADOLAN_GEOTRANSFORM = (RADOLAN_XLL, RADOLAN_CELL, 0.0,
+                        RADOLAN_YLL + RADOLAN_NROWS * RADOLAN_CELL, 0.0, -RADOLAN_CELL)
+
+RADOLAN_PRODUCTS = {
+    "RW": dict(label="Hourly precipitation (RW, 1-hour sum)", step_hours=1, unit="mm",
+               max_days=7),
+    "SF": dict(label="Daily precipitation (SF, 24-hour sum to 23:50 UTC)", step_hours=24,
+               unit="mm", max_days=120),
+}
+
+RADOLAN_PALETTE = ["#00ffffff", "#c6dbef", "#9ecae1", "#6baed6", "#3182bd", "#08519c",
+                   "#54278f", "#980043", "#e7298a", "#fdae61"]
+
+
+def decode_radolan_binary(raw):
+    """Parses a RADOLAN binary composite: an ASCII header terminated by
+    ETX (0x03), then rows x cols little-endian uint16, stored SOUTH row
+    first. The low 12 bits are the value in units of 10**precision; bit
+    0x2000 flags 'no data' (outside radar coverage). Returns (header,
+    float32 array north-up, NaN where no data)."""
+    end = raw.index(b"\x03")
+    header = raw[:end].decode("latin-1")
+    m = re.search(r"GP\s*(\d+)\s*x\s*(\d+)", header)
+    nrows, ncols = (int(m.group(1)), int(m.group(2))) if m else (RADOLAN_NROWS, RADOLAN_NCOLS)
+    m = re.search(r"PR\s*E([-+]?\d+)", header)
+    scale = 10.0 ** int(m.group(1)) if m else 0.1
+    arr = np.frombuffer(raw[end + 1:end + 1 + nrows * ncols * 2], dtype="<u2").reshape(nrows, ncols)
+    values = (arr & 0x0FFF).astype(np.float32) * np.float32(scale)
+    values[(arr & 0x2000) != 0] = np.nan
+    return header, values[::-1].copy()
+
+
+def _parse_radolan_asc(raw_bytes):
+    """RW ASCII grid -> float32 mm array (north-up, as ESRI ASCII always
+    is), NaN for the -1 no-data cells."""
+    text = raw_bytes.decode("latin-1")
+    lines = text.split("\n", 6)
+    header = dict(l.split() for l in lines[:6])
+    ncols, nrows = int(header["ncols"]), int(header["nrows"])
+    nodata = float(header["NODATA_value"])
+    values = np.array(lines[6].split(), dtype=np.float32).reshape(nrows, ncols)
+    values[values == nodata] = np.nan
+    return values / np.float32(10.0)
+
+
+def _rw_day_archive(session, day, cache_dir):
+    """Returns the bytes of RW-YYYYMMDD.tar.gz for `day`, from recent/ if
+    DWD still keeps it there, otherwise extracted from the monthly
+    historical bundle (downloaded once into cache_dir, then reused)."""
+    ymd = day.strftime("%Y%m%d")
+    url = f"{RADOLAN_BASE}hourly/radolan/recent/asc/RW-{ymd}.tar.gz"
+    r = session.get(url, timeout=120)
+    if r.status_code == 200:
+        return r.content, url
+    if r.status_code != 404:
+        r.raise_for_status()
+
+    ym = day.strftime("%Y%m")
+    hist_url = f"{RADOLAN_BASE}hourly/radolan/historical/asc/{day.year}/RW-{ym}.tar"
+    local = os.path.join(cache_dir, f"RW-{ym}.tar")
+    if not os.path.exists(local):
+        with session.get(hist_url, timeout=600, stream=True) as hr:
+            if hr.status_code == 404:
+                raise DwdError(f"No RADOLAN RW data for {day:%Y-%m-%d} (neither {url} nor {hist_url}).")
+            hr.raise_for_status()
+            tmp = local + ".part"
+            with open(tmp, "wb") as f:
+                for chunk in hr.iter_content(chunk_size=1 << 20):
+                    f.write(chunk)
+            os.replace(tmp, local)
+    with tarfile.open(local) as tf:
+        try:
+            member = tf.extractfile(f"RW-{ymd}.tar.gz")
+        except KeyError:
+            member = None
+        if member is None:
+            raise DwdError(f"RW-{ymd}.tar.gz is missing from {hist_url}.")
+        return member.read(), hist_url
+
+
+def _rw_day_grids(session, day, cache_dir):
+    """[(end_datetime_utc, array)] for the (normally 24) hourly RW grids
+    of one day, sorted by time."""
+    content, url = _rw_day_archive(session, day, cache_dir)
+    out = []
+    with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as tf:
+        for member in tf.getmembers():
+            m = re.search(r"RW_(\d{8})-(\d{4})\.asc$", member.name)
+            if not m:
+                continue
+            end = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M")
+            out.append((end, _parse_radolan_asc(tf.extractfile(member).read())))
+    out.sort(key=lambda t: t[0])
+    return out, url
+
+
+def _sf_day_grid(session, day, cache_dir):
+    end = datetime(day.year, day.month, day.day, 23, 50)
+    url = f"{RADOLAN_BASE}daily/radolan/recent/bin/raa01-sf_10000-{day:%y%m%d}2350-dwd---bin.gz"
+    r = session.get(url, timeout=60)
+    if r.status_code == 200:
+        _header, values = decode_radolan_binary(gzip.decompress(r.content))
+        return end, values, url
+    if r.status_code != 404:
+        r.raise_for_status()
+
+    hours, src = _rw_day_grids(session, day, cache_dir)
+    if not hours:
+        raise DwdError(f"No RADOLAN data for {day:%Y-%m-%d}.")
+    stack = np.stack([a for _, a in hours])
+    total = np.nansum(stack, axis=0)
+    total[np.all(np.isnan(stack), axis=0)] = np.nan
+    return end, total.astype(np.float32), f"{src} (sum of {len(hours)} hourly RW grids)"
+
+
+def iter_radolan_grids(product, start_date, end_date, hour=None, session=None,
+                       cache_dir=None, progress_cb=None):
+    """Yields dict(start, end, data, url) -- naive UTC datetimes bounding
+    the accumulation interval, plus a north-up float32 mm array -- for
+    every RADOLAN grid of `product` between two dates (inclusive). For RW,
+    `hour` (0-23, the hour the interval ends at, i.e. HH:50 UTC) restricts
+    the output to a single grid per day."""
+    session = session or _session()
+    cache_dir = cache_dir or tempfile.gettempdir()
+    step = timedelta(hours=RADOLAN_PRODUCTS[product]["step_hours"])
+    days = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+    for i, day in enumerate(days):
+        if progress_cb:
+            progress_cb(i, len(days), f"Fetching RADOLAN {product} for {day:%Y-%m-%d}")
+        if product == "SF":
+            end, values, url = _sf_day_grid(session, day, cache_dir)
+            yield dict(start=end - step, end=end, data=values, url=url)
+            continue
+        grids, url = _rw_day_grids(session, day, cache_dir)
+        for end, values in grids:
+            if hour is not None and end.hour != hour:
+                continue
+            yield dict(start=end - step, end=end, data=values, url=url)

@@ -2,6 +2,7 @@
 algorithms, so they're usable from Model Builder, the Processing history,
 batch mode, and `qgis_process` -- not just the dock widget."""
 import os
+from datetime import datetime
 
 import pandas as pd
 from qgis.core import (
@@ -21,6 +22,7 @@ from . import dwd_client as c
 from . import station_layer as sl
 from . import raster_layer as rl
 from . import pheno_layer as pl
+from . import timeline as tl
 
 ICON_PATH = os.path.join(os.path.dirname(__file__), "icons", "dwd_icon.svg")
 
@@ -34,6 +36,8 @@ YEAR_LABELS_LIST = [c.YEAR_RANGE_LABELS[k] for k in YEAR_CODES]
 PHENO_REPORTER_KEYS = list(c.PHENO_REPORTER_TYPES.keys())
 PHENO_REPORTER_LABELS = [c.PHENO_REPORTER_TYPES[k]["label"] for k in PHENO_REPORTER_KEYS]
 PHENO_COMBO_KEYS = list(c.PHENO_CATEGORIES.keys())
+RADOLAN_KEYS = list(c.RADOLAN_PRODUCTS.keys())
+RADOLAN_LABELS = [c.RADOLAN_PRODUCTS[k]["label"] for k in RADOLAN_KEYS]
 PHENO_COMBO_LABELS = [
     f"{'Annual' if rep == 'annual' else 'Immediate'} reporters – {c.PHENO_CATEGORIES[(rep, cat)]['label']}"
     for rep, cat in PHENO_COMBO_KEYS
@@ -65,6 +69,27 @@ class _StyleDeltaPostProcessor(QgsProcessingLayerPostProcessorInterface):
         rl._style_delta_layer(layer)
 
 
+class _StyleRadolanPostProcessor(QgsProcessingLayerPostProcessorInterface):
+    def __init__(self, vmax):
+        super().__init__()
+        self.vmax = vmax
+
+    def postProcessLayer(self, layer, context, feedback):
+        if not isinstance(layer, QgsRasterLayer):
+            return
+        layer.setCrs(rl.radolan_crs())
+        rl._style_layer(layer, c.RADOLAN_PALETTE, vmin=0.0, vmax=self.vmax)
+
+
+class _PhenoObsPostProcessor(QgsProcessingLayerPostProcessorInterface):
+    def postProcessLayer(self, layer, context, feedback):
+        try:
+            pl.apply_doy_renderer(layer)
+            tl.set_vector_time_fields(layer, "obs_date", "visible_to")
+        except Exception:
+            pass
+
+
 def _progress_feedback(feedback):
     def progress(i, n, msg):
         feedback.setProgress(int(100 * i / max(n, 1)))
@@ -91,6 +116,8 @@ class DWDProcessingProvider(QgsProcessingProvider):
         self.addAlgorithm(DeltaRasterAlgorithm())
         self.addAlgorithm(FetchPhenologyStationListAlgorithm())
         self.addAlgorithm(FetchPhenologyDataAlgorithm())
+        self.addAlgorithm(FetchPhenologyObservationsAlgorithm())
+        self.addAlgorithm(FetchRadolanAlgorithm())
 
 
 class _DWDAlgorithmBase(QgsProcessingAlgorithm):
@@ -362,6 +389,18 @@ class DeltaRasterAlgorithm(_DWDAlgorithmBase):
         return {self.OUTPUT: dest}
 
 
+def _match_species(species_index, species_input):
+    """Species token for a user-typed name: token or label, case-insensitive,
+    spaces and underscores interchangeable."""
+    needle = species_input.lower().replace(" ", "_")
+    for candidate_token, entry in species_index.species.items():
+        if candidate_token.lower() == needle or entry["label"].lower() == species_input.lower():
+            return candidate_token, entry["label"]
+    available = ", ".join(sorted(e["label"] for e in species_index.species.values()))
+    raise QgsProcessingException(
+        f"Species '{species_input}' not found for this category. Available: {available}")
+
+
 class FetchPhenologyStationListAlgorithm(_DWDAlgorithmBase):
     REPORTER = "REPORTER"
     OUTPUT = "OUTPUT"
@@ -445,16 +484,7 @@ class FetchPhenologyDataAlgorithm(_DWDAlgorithmBase):
 
         feedback.pushInfo(f"Looking up species list for {reporter}/{category}...")
         species_index = c.list_phenology_species(reporter, category)
-        needle = species_input.lower().replace(" ", "_")
-        token, matched_label = None, None
-        for candidate_token, entry in species_index.species.items():
-            if candidate_token.lower() == needle or entry["label"].lower() == species_input.lower():
-                token, matched_label = candidate_token, entry["label"]
-                break
-        if token is None:
-            available = ", ".join(sorted(e["label"] for e in species_index.species.values()))
-            raise QgsProcessingException(
-                f"Species '{species_input}' not found for this category. Available: {available}")
+        token, matched_label = _match_species(species_index, species_input)
 
         feedback.pushInfo(f"Fetching '{matched_label}' data for station {station_id}...")
         df = c.fetch_phenology_species_data(
@@ -481,3 +511,145 @@ class FetchPhenologyDataAlgorithm(_DWDAlgorithmBase):
 
         feedback.pushInfo(f"{len(df)} phenology records written.")
         return {self.OUTPUT: dest_id}
+
+
+class FetchPhenologyObservationsAlgorithm(_DWDAlgorithmBase):
+    CATEGORY = "CATEGORY"
+    SPECIES = "SPECIES"
+    PHASE_ID = "PHASE_ID"
+    YEAR_FROM = "YEAR_FROM"
+    YEAR_TO = "YEAR_TO"
+    OUTPUT = "OUTPUT"
+
+    def name(self):
+        return "fetch_phenology_observations"
+
+    def displayName(self):
+        return "Fetch DWD phenology observations (all stations)"
+
+    def shortHelpString(self):
+        return ("Builds a point layer of every station's entry date of one phenological "
+                "phase for one species over a year range, coloured by day of year and "
+                "time-aware (in the Temporal Controller each point is visible from its entry "
+                "date to the end of that year). PHASE_ID 0 keeps every phase; phase IDs are "
+                "listed in DWD's PH_Beschreibung_Phase.txt and in the dock widget's Phenology "
+                "tab. SPECIES as for 'Fetch DWD phenology data'.")
+
+    def createInstance(self):
+        return FetchPhenologyObservationsAlgorithm()
+
+    def initAlgorithm(self, config=None):
+        self.addParameter(QgsProcessingParameterEnum(
+            self.CATEGORY, "Reporter type / category", options=PHENO_COMBO_LABELS, defaultValue=0))
+        self.addParameter(QgsProcessingParameterString(
+            self.SPECIES, "Species (e.g. 'Schneegloeckchen')"))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.PHASE_ID, "Phase ID (0 = all phases)", Qgis.ProcessingNumberParameterType.Integer,
+            defaultValue=0, minValue=0))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.YEAR_FROM, "First year", Qgis.ProcessingNumberParameterType.Integer,
+            defaultValue=1991, minValue=1900))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.YEAR_TO, "Last year", Qgis.ProcessingNumberParameterType.Integer,
+            defaultValue=datetime.now().year, minValue=1900))
+        self.addParameter(QgsProcessingParameterFeatureSink(self.OUTPUT, "Phenology observations"))
+
+    def processAlgorithm(self, parameters, context, feedback):
+        reporter, category = PHENO_COMBO_KEYS[self.parameterAsEnum(parameters, self.CATEGORY, context)]
+        species_input = self.parameterAsString(parameters, self.SPECIES, context).strip()
+        phase_id = self.parameterAsInt(parameters, self.PHASE_ID, context) or None
+        y0 = self.parameterAsInt(parameters, self.YEAR_FROM, context)
+        y1 = self.parameterAsInt(parameters, self.YEAR_TO, context)
+
+        feedback.pushInfo(f"Looking up species list for {reporter}/{category}...")
+        species_index = c.list_phenology_species(reporter, category)
+        token, matched_label = _match_species(species_index, species_input)
+        feedback.pushInfo("Fetching phenology station list...")
+        stations = c.fetch_phenology_stations(reporter)
+        feedback.pushInfo(f"Fetching all '{matched_label}' observations...")
+        df = c.fetch_phenology_observations(reporter, category, token, stations,
+                                            phase_id=phase_id, year_range=(y0, y1),
+                                            species_index=species_index)
+        if df is None or len(df) == 0:
+            raise QgsProcessingException("No observations match this species / phase / year range.")
+        layer = pl.build_pheno_obs_layer(df, matched_label)
+
+        sink, dest_id = self.parameterAsSink(
+            parameters, self.OUTPUT, context, layer.fields(), Qgis.WkbType.Point, layer.crs())
+        if sink is None:
+            raise QgsProcessingException(self.invalidSinkError(parameters, self.OUTPUT))
+        for feat in layer.getFeatures():
+            sink.addFeature(feat, QgsFeatureSink.FastInsert)
+
+        try:
+            details = context.layerToLoadOnCompletionDetails(dest_id)
+            processor = _PhenoObsPostProcessor()
+            details.setPostProcessor(processor)
+            self._post_processor = processor
+        except Exception:
+            pass
+
+        feedback.pushInfo(f"{len(df)} observations at {df['Stations_id'].nunique()} stations written.")
+        return {self.OUTPUT: dest_id}
+
+
+class FetchRadolanAlgorithm(_DWDAlgorithmBase):
+    PRODUCT = "PRODUCT"
+    DATE = "DATE"
+    HOUR = "HOUR"
+    OUTPUT = "OUTPUT"
+
+    def name(self):
+        return "fetch_radolan"
+
+    def displayName(self):
+        return "Fetch RADOLAN precipitation grid"
+
+    def shortHelpString(self):
+        return ("Downloads one RADOLAN radar precipitation grid (1km, all of Germany, 2005 "
+                "onwards) as a GeoTIFF in mm: RW = 1-hour sum ending at HOUR:50 UTC on DATE, "
+                "SF = 24-hour sum ending 23:50 UTC on DATE (HOUR ignored). Dates older than "
+                "DWD's 'recent' window are read from monthly archives (~40 MB, cached in the "
+                "temp folder).")
+
+    def createInstance(self):
+        return FetchRadolanAlgorithm()
+
+    def initAlgorithm(self, config=None):
+        self.addParameter(QgsProcessingParameterEnum(
+            self.PRODUCT, "Product", options=RADOLAN_LABELS, defaultValue=RADOLAN_KEYS.index("SF")))
+        self.addParameter(QgsProcessingParameterString(self.DATE, "Date (YYYY-MM-DD, UTC)"))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.HOUR, "Hour the RW interval ends (0-23, at HH:50 UTC)",
+            Qgis.ProcessingNumberParameterType.Integer, defaultValue=12, minValue=0, maxValue=23))
+        self.addParameter(QgsProcessingParameterRasterDestination(self.OUTPUT, "RADOLAN grid"))
+
+    def processAlgorithm(self, parameters, context, feedback):
+        product = RADOLAN_KEYS[self.parameterAsEnum(parameters, self.PRODUCT, context)]
+        date_str = self.parameterAsString(parameters, self.DATE, context).strip()
+        try:
+            day = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            raise QgsProcessingException(f"Date '{date_str}' is not in YYYY-MM-DD format.")
+        hour = self.parameterAsInt(parameters, self.HOUR, context) if product == "RW" else None
+
+        feedback.pushInfo(f"Fetching RADOLAN {product} for {day}...")
+        grids = list(c.iter_radolan_grids(product, day, day, hour=hour))
+        if not grids:
+            raise QgsProcessingException("No RADOLAN grid found for that date/hour.")
+        g = grids[0]
+        feedback.pushInfo(f"Source: {g['url']}")
+        feedback.pushInfo(f"Interval (UTC): {g['start']:%Y-%m-%d %H:%M} to {g['end']:%Y-%m-%d %H:%M}")
+
+        dest = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
+        rl.write_radolan_geotiff(dest, g["data"])
+
+        try:
+            details = context.layerToLoadOnCompletionDetails(dest)
+            processor = _StyleRadolanPostProcessor(rl.radolan_colour_max(g["data"]))
+            details.setPostProcessor(processor)
+            self._post_processor = processor
+        except Exception:
+            pass
+
+        return {self.OUTPUT: dest}
